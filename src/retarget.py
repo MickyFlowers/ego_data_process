@@ -1,3 +1,6 @@
+# Python 3.11+ compat (inspect.getargspec)
+import src.compat  # noqa: F401
+
 import json
 
 import cv2

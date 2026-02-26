@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Python 3.11+ compat before any other imports
+import src.compat  # noqa: F401
+
 """
 Ray parallel batch: dual-arm IK + joint KF smoothing for all JSON files in a folder.
 

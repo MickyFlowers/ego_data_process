@@ -1,3 +1,6 @@
+# Python 3.11+ compat before any other imports
+import src.compat  # noqa: F401
+
 """
 Ray parallel batch: retarget all .pose3d_hand files under a directory (recursive by default).
 Finds all clip_ids by scanning for *.pose3d_hand; one task per unique clip_id (first path wins).
