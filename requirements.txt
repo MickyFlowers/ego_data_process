@@ -1,2 +1,9 @@
 pybullet
 ray
+opencv-python-headless
+scipy
+imageio
+imageio-ffmpeg
+torch
+torchvision
+scipy

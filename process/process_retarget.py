@@ -23,7 +23,9 @@ import json
 import math
 import os
 import random
+import sys
 import time
+import traceback
 from pathlib import Path
 
 import ray
@@ -183,7 +185,8 @@ def main():
             stats = ray.get(future)
             results.append(stats)
         except Exception as e:
-            print(f"[Batch] {cid} failed: {e}")
+            print(f"[Batch] FAILED {cid}: {e}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
             results.append({"clip_id": cid, "error": str(e)})
         n_done += 1
         if n_done % 50 == 0 or n_done == n_total:
@@ -197,10 +200,12 @@ def main():
     success_results = [r for r in results if "error" not in r]
     total_frames = sum(r.get("n_frames", 0) for r in success_results)
     summary_path = os.path.join(args.output_dir, "summary.json")
+    failed_list = [r for r in results if "error" in r]
     summary = {
         "total": n_total,
         "success": len(success_results),
-        "failed": sum(1 for r in results if "error" in r),
+        "failed": len(failed_list),
+        "failed_clips": [{"clip_id": r["clip_id"], "error": r["error"]} for r in failed_list],
         "sample_count": len(sample_indices),
         "sample_ratio": args.sample_ratio,
         "total_time": total_time,
@@ -212,6 +217,12 @@ def main():
 
     print(f"[Batch] Done: {summary['success']}/{n_total} ok, {summary['failed']} failed | "
           f"{total_time:.0f}s, {total_frames} frames, {summary_path}")
+
+    if failed_list:
+        print("\n[Batch] Failed clips:", file=sys.stderr)
+        for r in failed_list:
+            print(f"  {r['clip_id']}: {r['error']}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
