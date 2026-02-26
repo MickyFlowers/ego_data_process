@@ -1,5 +1,6 @@
 """
-Ray parallel batch: retarget all .pose3d_hand files in a folder.
+Ray parallel batch: retarget all .pose3d_hand files under a directory (recursive by default).
+Finds all clip_ids by scanning for *.pose3d_hand; one task per unique clip_id (first path wins).
 Sampled clips get replay video generated in the same worker (no separate replay pass).
 
 Output layout:
@@ -94,8 +95,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="Ray parallel batch retarget (.pose3d_hand -> JSON + optional replay video)"
     )
-    parser.add_argument("--data-dir", type=str, required=True, help="Input dir with .pose3d_hand files")
+    parser.add_argument("--data-dir", type=str, required=True, help="Input dir (searched recursively for .pose3d_hand)")
     parser.add_argument("-o", "--output-dir", type=str, required=True, help="Output root directory")
+    parser.add_argument("--no-recursive", action="store_true", help="Only look in data-dir, not subdirs")
     parser.add_argument("-m", "--model-dir", type=str,
                         default="./assets/mano_v1_2/models",
                         help="MANO model directory")
@@ -113,9 +115,19 @@ def main():
     if not input_dir.is_dir():
         raise SystemExit(f"Input path is not a directory: {input_dir}")
 
-    files = sorted(input_dir.glob("*.pose3d_hand"))
+    if args.no_recursive:
+        candidates = sorted(input_dir.glob("*.pose3d_hand"))
+    else:
+        candidates = sorted(input_dir.rglob("*.pose3d_hand"), key=lambda p: (p.stem, str(p)))
+    # One path per clip_id (first found wins)
+    seen: set[str] = set()
+    files = []
+    for p in candidates:
+        if p.stem not in seen:
+            seen.add(p.stem)
+            files.append(p)
     if not files:
-        print(f"[Batch] No .pose3d_hand files in {input_dir}")
+        print(f"[Batch] No .pose3d_hand files under {input_dir}")
         return
 
     n_total = len(files)
