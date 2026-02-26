@@ -23,7 +23,8 @@ MESH_RGBA = (0.055, 0.055, 0.055, 1.0)
 COLLISION_MARGIN = 0.005
 EARLY_OUT_DIST = 0.5
 REPLAY_FPS = 60
-IK_JUMP_THRESHOLD = 0.5  # rad per frame — reject IK solutions that jump more than this
+IK_JUMP_THRESHOLD = 0.5  # rad per frame — max joint velocity ≈ 15 rad/s @30fps
+KF_EDGE_PAD = 15  # frames to replicate at edges before KF smoothing (absorbs RTS boundary effect)
 # Validation render: low res, no shadows, for speed
 RENDER_RESOLUTION = [320, 240]
 
@@ -139,6 +140,47 @@ def align_poses_to_workstation(
     return left_new, right_new, cam
 
 
+BOUNDARY_TRIM_THRESHOLD = 0.5  # max pose-6D delta to consider a boundary frame valid
+
+
+def _trim_bad_boundary_frames(
+    left_poses: np.ndarray,
+    right_poses: np.ndarray,
+    threshold: float = BOUNDARY_TRIM_THRESHOLD,
+    max_trim: int = 5,
+) -> tuple[int, int]:
+    """
+    Detect garbage frames at trajectory boundaries by checking per-frame
+    pose-6D deltas.  Returns (trim_start, trim_end): number of frames to
+    discard from each end.  Scans inward from each boundary, stopping at the
+    first frame whose delta to its neighbour is below *threshold*.
+    """
+    n = min(left_poses.shape[0], right_poses.shape[0])
+    if n < 3:
+        return 0, 0
+
+    def _max_delta(i: int, j: int) -> float:
+        dl = np.max(np.abs(left_poses[i, :6] - left_poses[j, :6]))
+        dr = np.max(np.abs(right_poses[i, :6] - right_poses[j, :6]))
+        return max(float(dl), float(dr))
+
+    trim_end = 0
+    for k in range(min(max_trim, n - 1)):
+        if _max_delta(n - 1 - k, n - 2 - k) > threshold:
+            trim_end = k + 1
+        else:
+            break
+
+    trim_start = 0
+    for k in range(min(max_trim, n - 1)):
+        if _max_delta(k, k + 1) > threshold:
+            trim_start = k + 1
+        else:
+            break
+
+    return trim_start, trim_end
+
+
 def map_gripper_to_01_and_smooth(
     left_gripper_raw: np.ndarray,
     right_gripper_raw: np.ndarray,
@@ -160,7 +202,7 @@ def map_gripper_to_01_and_smooth(
     T = left_m.shape[0]
     obs = np.stack([left_m, right_m], axis=1)
     jkf = JointKalmanFilter(n_dim=2, dt=1.0 / fps, q_var=100.0, r_var=5e-4)
-    smoothed = jkf.filter_and_smooth(obs)
+    smoothed = jkf.filter_and_smooth(obs, edge_pad=KF_EDGE_PAD)
     smoothed = np.clip(smoothed, out_min, out_max)
     return smoothed[:, 0], smoothed[:, 1]
 
@@ -185,12 +227,19 @@ def load_pose_data_from_json(
 
     left_poses = np.asarray(data["poses"]["left"], dtype=np.float64)
     right_poses = np.asarray(data["poses"]["right"], dtype=np.float64)
-    n_left, n_right = left_poses.shape[0], right_poses.shape[0]
-    # Pose uses first 6 dims; 7th is gripper (0~1)
     if left_poses.ndim == 1:
         left_poses = left_poses.reshape(1, -1)
     if right_poses.ndim == 1:
         right_poses = right_poses.reshape(1, -1)
+
+    # Trim garbage frames at boundaries (retarget often produces reset/zero poses at clip edges)
+    trim_s, trim_e = _trim_bad_boundary_frames(left_poses, right_poses)
+    if trim_s or trim_e:
+        end_idx = left_poses.shape[0] - trim_e if trim_e else left_poses.shape[0]
+        left_poses = left_poses[trim_s:end_idx]
+        right_poses = right_poses[trim_s:end_idx]
+
+    n_left, n_right = left_poses.shape[0], right_poses.shape[0]
     pose_dim = left_poses.shape[1]
     if pose_dim >= 7:
         left_gripper_raw = left_poses[:, 6]
@@ -219,8 +268,8 @@ def load_pose_data_from_json(
         ekf = PoseExtendedKalmanFilter(
             dt=1.0 / fps, q_pos=1000.0, q_rot=1000.0, r_pos=5e-4, r_rot=1e-3,
         )
-        left_T = ekf.filter_and_smooth(left_T)
-        right_T = ekf.filter_and_smooth(right_T)
+        left_T = ekf.filter_and_smooth(left_T, edge_pad=KF_EDGE_PAD)
+        right_T = ekf.filter_and_smooth(right_T, edge_pad=KF_EDGE_PAD)
 
     return left_T, right_T, cam, fps, output_data, left_gripper, right_gripper, camera_intrinsics, img_size, video_path
 
@@ -455,25 +504,41 @@ def _ik_solve_single_arm(
     jump_threshold: float,
 ) -> tuple[list[float], bool]:
     """
-    Solve IK for one arm with branch-jump protection.
+    Solve IK for one arm with branch-jump protection (rate-limited).
 
     If the new solution jumps more than *jump_threshold* from prev_q,
-    reset joint states to prev_q and re-solve. If still jumping, fall
-    back to prev_q to prevent restPoses contamination.
+    reset joint states to prev_q and re-solve. If still exceeding the
+    threshold, rate-limit each joint (move toward the solution by at
+    most *jump_threshold* per frame) instead of freezing.
 
-    Returns (q_arm, was_clamped).
+    Returns (q_arm, was_rate_limited).
     """
+    is_first = prev_q is None
+    max_iters = 500 if is_first else 100
+    res_thr = 1e-6 if is_first else 1e-5
+
     q_all = p.calculateInverseKinematics(
         rid, tcp_link, pos, quat,
-        maxNumIterations=100, residualThreshold=1e-5, restPoses=rest_poses,
+        maxNumIterations=max_iters, residualThreshold=res_thr, restPoses=rest_poses,
     )
     q = [q_all[k] for k in dof_indices]
 
-    clamped = False
+    # First frame: commit immediately then re-solve to let IK refine from its own solution
+    if is_first:
+        for k, j in enumerate(arm_joint_indices):
+            p.resetJointState(rid, j, q[k])
+            rest_poses[dof_per_joint.index(j)] = q[k]
+        q_all = p.calculateInverseKinematics(
+            rid, tcp_link, pos, quat,
+            maxNumIterations=500, residualThreshold=1e-7, restPoses=rest_poses,
+        )
+        q = [q_all[k] for k in dof_indices]
+
+    rate_limited = False
     if prev_q is not None:
         max_d = max(abs(q[k] - prev_q[k]) for k in range(len(q)))
         if max_d > jump_threshold:
-            # Reset joints to previous frame (changes IK starting point)
+            # Retry with joints reset to previous frame
             for k, j in enumerate(arm_joint_indices):
                 p.resetJointState(rid, j, prev_q[k])
             q_all2 = p.calculateInverseKinematics(
@@ -486,15 +551,19 @@ def _ik_solve_single_arm(
                 q = q2
                 max_d = d2
             if max_d > jump_threshold:
-                q = list(prev_q)
-                clamped = True
+                # Rate-limit: move toward solution but cap step per joint
+                for k in range(len(q)):
+                    delta = q[k] - prev_q[k]
+                    if abs(delta) > jump_threshold:
+                        q[k] = prev_q[k] + jump_threshold * (1.0 if delta > 0 else -1.0)
+                rate_limited = True
 
     # Commit: update joint states and restPoses
     for k, j in enumerate(arm_joint_indices):
         p.resetJointState(rid, j, q[k])
         rest_poses[dof_per_joint.index(j)] = q[k]
 
-    return q, clamped
+    return q, rate_limited
 
 
 def solve_dual_arm_ik(
@@ -534,6 +603,7 @@ def solve_dual_arm_ik(
         r_pos = T_r[:3, 3].tolist()
         r_quat = R.from_matrix(T_r[:3, :3]).as_quat().tolist()
 
+        # First frame: no jump protection (free jump from rest poses)
         prev_l = left_traj[-1] if left_traj else None
         prev_r = right_traj[-1] if right_traj else None
 
@@ -574,15 +644,17 @@ def solve_dual_arm_ik(
                 robot_info, l_pos, l_quat, r_pos, r_quat, q0
             )
 
-            # Post-collision jump guard: don't let collision resolver switch branches
+            # Post-collision jump guard: rate-limit instead of freezing
             if prev_l is not None:
-                post_d_l = max(abs(q_left[k] - prev_l[k]) for k in range(6))
-                if post_d_l > jump_threshold:
-                    q_left = list(prev_l)
+                for k in range(6):
+                    delta = q_left[k] - prev_l[k]
+                    if abs(delta) > jump_threshold:
+                        q_left[k] = prev_l[k] + jump_threshold * (1.0 if delta > 0 else -1.0)
             if prev_r is not None:
-                post_d_r = max(abs(q_right[k] - prev_r[k]) for k in range(6))
-                if post_d_r > jump_threshold:
-                    q_right = list(prev_r)
+                for k in range(6):
+                    delta = q_right[k] - prev_r[k]
+                    if abs(delta) > jump_threshold:
+                        q_right[k] = prev_r[k] + jump_threshold * (1.0 if delta > 0 else -1.0)
 
             set_arm_joints(robot_info, q_left, q_right)
             for k, j in enumerate(left_arm_joint_indices):
@@ -1118,10 +1190,24 @@ def process_single_clip(
     left_arr, n_left_repaired = repair_joint_trajectory_jumps(np.array(left_joint_traj), verbose=verbose)
     right_arr, n_right_repaired = repair_joint_trajectory_jumps(np.array(right_joint_traj), verbose=verbose)
 
-    # --- Joint KF smoothing ---
-    jkf = JointKalmanFilter(n_dim=6, dt=1.0 / fps, q_var=100.0, r_var=5e-4)
-    left_joint_traj = jkf.filter_and_smooth(left_arr)
-    right_joint_traj = jkf.filter_and_smooth(right_arr)
+    # --- Joint KF smoothing (r_var controls smoothing strength; higher = smoother) ---
+    jkf = JointKalmanFilter(n_dim=6, dt=1.0 / fps, q_var=50.0, r_var=5e-3)
+    left_joint_traj = jkf.filter_and_smooth(left_arr, edge_pad=KF_EDGE_PAD)
+    right_joint_traj = jkf.filter_and_smooth(right_arr, edge_pad=KF_EDGE_PAD)
+
+    # --- Per-joint max frame-to-frame delta (on final smoothed trajectory) ---
+    left_final = np.asarray(left_joint_traj)
+    right_final = np.asarray(right_joint_traj)
+    if left_final.shape[0] > 1:
+        left_deltas = np.max(np.abs(np.diff(left_final, axis=0)), axis=0)
+        right_deltas = np.max(np.abs(np.diff(right_final, axis=0)), axis=0)
+    else:
+        left_deltas = np.zeros(6)
+        right_deltas = np.zeros(6)
+    max_joint_delta = {
+        "left": {f"joint{k+1}": float(left_deltas[k]) for k in range(6)},
+        "right": {f"joint{k+1}": float(right_deltas[k]) for k in range(6)},
+    }
 
     # --- Build full joint trajectory ---
     joint_traj = build_full_joint_trajectory(
@@ -1145,6 +1231,7 @@ def process_single_clip(
         "ik_time_per_frame": ik_time / max(n_frames, 1),
         "collision_count": collision_count,
         "ik_stats": ik_stats,
+        "max_joint_delta": max_joint_delta,
         "jump_repair": {
             "left_repaired_frames": n_left_repaired,
             "right_repaired_frames": n_right_repaired,
@@ -1178,12 +1265,10 @@ def process_single_clip(
         print(f"[{clip_id}] Done: {n_frames} frames, IK {ik_time:.1f}s, collisions {collision_count}")
     return stats
 
-
 def main() -> None:
-    json_path = "/home/cyx/projects/test_ik/outputs/data/P04_25_422_00057.json"
-    urdf = os.path.join(os.path.dirname(__file__), "../mobile_aloha_sim/aloha_new_description/urdf/dual_piper.urdf")
-    process_single_clip(json_path, output_dir="outputs/ik", do_render=True, use_gui=False, urdf_path=urdf)
-
+    json_path = os.path.abspath("outputs/epfl_retarget/data/YH2002_2023_12_04_10_15_23__11585_12023_439.json")
+    urdf = os.path.abspath("assets/aloha_new_description/urdf/dual_piper.urdf")
+    process_single_clip(json_path, output_dir="outputs/epfl_ik", do_render=False, use_gui=True, urdf_path=urdf)
 
 if __name__ == "__main__":
     main()

@@ -68,16 +68,24 @@ class JointKalmanFilter:
         self.R = r_var * np.eye(self.n)
 
     # ── forward filter + backward RTS ──────────────────────────────────
-    def filter_and_smooth(self, observations: np.ndarray) -> np.ndarray:
+    def filter_and_smooth(self, observations: np.ndarray, edge_pad: int = 0) -> np.ndarray:
         """
         Parameters
         ----------
         observations : ndarray, shape (T, n_dim)
+        edge_pad     : int – replicate first/last frame this many times to
+                        absorb RTS boundary effects; stripped before return.
 
         Returns
         -------
         smoothed : ndarray, shape (T, n_dim)
         """
+        orig_T = observations.shape[0]
+        if edge_pad > 0 and orig_T > 1:
+            pad_s = np.tile(observations[0:1], (edge_pad, 1))
+            pad_e = np.tile(observations[-1:], (edge_pad, 1))
+            observations = np.concatenate([pad_s, observations, pad_e], axis=0)
+
         T = observations.shape[0]
         sd, n = self.sd, self.n
         I_sd = np.eye(sd)
@@ -115,7 +123,10 @@ class JointKalmanFilter:
             G = Pf[t] @ self.F.T @ np.linalg.inv(Pp[t + 1])
             xs[t] = xf[t] + G @ (xs[t + 1] - xp[t + 1])
 
-        return xs[:, :n]
+        result = xs[:, :n]
+        if edge_pad > 0 and orig_T > 1:
+            result = result[edge_pad:edge_pad + orig_T]
+        return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -240,16 +251,24 @@ class PoseExtendedKalmanFilter:
         return z - self.H @ xp
 
     # ── main entry point ──────────────────────────────────────────────
-    def filter_and_smooth(self, pose_matrices: np.ndarray) -> np.ndarray:
+    def filter_and_smooth(self, pose_matrices: np.ndarray, edge_pad: int = 0) -> np.ndarray:
         """
         Parameters
         ----------
         pose_matrices : ndarray, shape (T, 4, 4)
+        edge_pad      : int – replicate first/last pose this many times to
+                         absorb RTS boundary effects; stripped before return.
 
         Returns
         -------
         smoothed : ndarray, shape (T, 4, 4)
         """
+        orig_T = pose_matrices.shape[0]
+        if edge_pad > 0 and orig_T > 1:
+            pad_s = np.tile(pose_matrices[0:1], (edge_pad, 1, 1))
+            pad_e = np.tile(pose_matrices[-1:], (edge_pad, 1, 1))
+            pose_matrices = np.concatenate([pad_s, pose_matrices, pad_e], axis=0)
+
         T = pose_matrices.shape[0]
 
         obs = np.zeros((T, 6))
@@ -302,6 +321,8 @@ class PoseExtendedKalmanFilter:
         result = np.zeros((T, 4, 4))
         for t in range(T):
             result[t] = self.pose6d_to_mat(xs[t, :6])
+        if edge_pad > 0 and orig_T > 1:
+            result = result[edge_pad:edge_pad + orig_T]
         return result
 
 
