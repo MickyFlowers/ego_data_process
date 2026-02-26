@@ -55,7 +55,7 @@ def main():
     parser.add_argument("--num-cpus", type=int, default=None, help="Total CPUs for Ray (default: all)")
     parser.add_argument("--num-gpus", type=int, default=None, help="Total GPUs for Ray (default: all)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for sampling")
-    parser.add_argument("--render-resolution", type=list[int], default=[320, 240], help="Render resolution")
+    parser.add_argument("--render-resolution", type=list[int], default=[640, 480], help="Render resolution")
     parser.add_argument("--urdf-path", type=str, default="./assets/aloha_new_description/urdf/dual_piper.urdf", help="URDF path")
     args = parser.parse_args()
 

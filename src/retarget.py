@@ -13,6 +13,9 @@ from typing import Dict, List, Tuple
 
 from manopth.manolayer import ManoLayer
 
+# Saved video resolution for both retarget replay and (when aligned) IK overlay; (width, height)
+SAVED_VIDEO_RESOLUTION = (640, 480)
+
 
 def _to_json_serializable(obj):
     """Recursively convert Tensors and ndarrays to lists for JSON."""
@@ -555,10 +558,6 @@ class HandRetargetPipeline:
             axes_uv_left[m] = self.projector.project_np(axes_left, intrinsic_np)
             axes_uv_right[m] = self.projector.project_np(axes_right, intrinsic_np)
 
-        img_size_np = img_size.detach().cpu().numpy()
-        out_w = int(round(float(img_size_np[0])))
-        out_h = int(round(float(img_size_np[1])))
-
         self.visualizer.render_video(
             video_path,
             out_path,
@@ -569,7 +568,7 @@ class HandRetargetPipeline:
             axes_uv_left,
             axes_uv_right,
             method_list,
-            (out_w, out_h),
+            SAVED_VIDEO_RESOLUTION,
             draw_kps,
         )
     
@@ -668,7 +667,7 @@ class HandRetargetPipeline:
             video_path = Path(video_path)
 
         intrinsic_np = np.array(all_data["camera"]["intrinsic"], dtype=np.float32)
-        out_w, out_h = all_data["camera"]["img_size"]
+        out_w, out_h = SAVED_VIDEO_RESOLUTION
         pose_dict = all_data["poses"]
         if isinstance(pose_dict.get("left"), list):
             left_poses = pose_dict.get("left", [])
@@ -697,6 +696,7 @@ class HandRetargetPipeline:
                 break
             if frame_idx % step != 0:
                 continue
+            # Always resize to SAVED_VIDEO_RESOLUTION for consistent output
             if frame.shape[1] != out_w or frame.shape[0] != out_h:
                 frame = cv2.resize(frame, (out_w, out_h))
             frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)

@@ -26,7 +26,7 @@ REPLAY_FPS = 60
 IK_JUMP_THRESHOLD = 0.5  # rad per frame — max joint velocity ≈ 15 rad/s @30fps
 KF_EDGE_PAD = 15  # frames to replicate at edges before KF smoothing (absorbs RTS boundary effect)
 # Validation render: low res, no shadows, for speed
-RENDER_RESOLUTION = [320, 240]
+RENDER_RESOLUTION = [640, 480]
 
 LEFT_JOINT_NAMES = (
     "left_joint1", "left_joint2", "left_joint3",
@@ -1024,8 +1024,11 @@ def render_and_overlay(
             robot_rgb = np.asarray(Image.fromarray(robot_rgb).resize((bg_w, bg_h), Image.BILINEAR))
             mask = np.asarray(Image.fromarray(mask.astype(np.uint8) * 255).resize((bg_w, bg_h), Image.NEAREST)) > 127
 
-        # --- Overlay + write frame ---
+        # --- Overlay then resize to render_size so saved video uses this resolution ---
         bg[mask] = robot_rgb[mask]
+        out_w, out_h = int(render_size[0]), int(render_size[1])
+        if (bg_w, bg_h) != (out_w, out_h):
+            bg = np.asarray(Image.fromarray(bg).resize((out_w, out_h), Image.BILINEAR))
         writer.append_data(bg[:, :, :3])
 
         if verbose and ((i + 1) % 200 == 0 or i == n_frames - 1):
