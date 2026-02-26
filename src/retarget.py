@@ -16,6 +16,18 @@ from manopth.manolayer import ManoLayer
 # Saved video resolution for both retarget replay and (when aligned) IK overlay; (width, height)
 SAVED_VIDEO_RESOLUTION = (640, 480)
 
+
+def scale_intrinsics(K: np.ndarray, src_size: list, dst_size: list) -> np.ndarray:
+    """Scale 3x3 intrinsics from src_size to dst_size. Both sizes as [width, height]."""
+    K = np.asarray(K, dtype=np.float64).copy()
+    sx = dst_size[0] / max(1, src_size[0])
+    sy = dst_size[1] / max(1, src_size[1])
+    K[0, 0] *= sx
+    K[1, 1] *= sy
+    K[0, 2] *= sx
+    K[1, 2] *= sy
+    return K.astype(np.float32)
+
 # Gripper (pinch) mapping: absolute scale + nonlinear curve (more sensitivity when hand is nearly closed).
 # Thumb–index distance in meters.
 PINCH_DIST_CLOSED_M = 0.05
@@ -547,26 +559,27 @@ class HandRetargetPipeline:
 
         traj = self.projector.apply_scale(result["camera"]["traj"], result["camera"]["scale"])
         intrinsic = self.projector.build_intrinsic(result["camera"]["img_focal"], result["camera"]["img_center"])
-        intrinsic = intrinsic.to(left_world.dtype)
         img_size = result["camera"]["img_center"] * 2
+        s0 = img_size[0].item() if hasattr(img_size[0], "item") else float(img_size[0])
+        s1 = img_size[1].item() if hasattr(img_size[1], "item") else float(img_size[1])
+        src_size = [int(round(s0)), int(round(s1))]
+        intrinsic_np = scale_intrinsics(
+            intrinsic.detach().cpu().numpy(), src_size, list(SAVED_VIDEO_RESOLUTION)
+        )
 
         left_cam_t = self.projector.world_to_camera(left_world, traj)
         right_cam_t = self.projector.world_to_camera(right_world, traj)
-        left_img_t = self.projector.project(left_cam_t, intrinsic)
-        right_img_t = self.projector.project(right_cam_t, intrinsic)
-
-        left_img = left_img_t.detach().cpu().numpy()
-        right_img = right_img_t.detach().cpu().numpy()
-        left_valid = left_valid_t.detach().cpu().numpy().astype(bool)
-        right_valid = right_valid_t.detach().cpu().numpy().astype(bool)
         left_cam = left_cam_t.detach().cpu().numpy()
         right_cam = right_cam_t.detach().cpu().numpy()
+        left_img = self.projector.project_np(left_cam, intrinsic_np)
+        right_img = self.projector.project_np(right_cam, intrinsic_np)
+
+        left_valid = left_valid_t.detach().cpu().numpy().astype(bool)
+        right_valid = right_valid_t.detach().cpu().numpy().astype(bool)
 
         method_list = [m.strip() for m in methods.split(",") if m.strip()] or ["pinch"]
         axes_uv_left = {}
         axes_uv_right = {}
-        intrinsic_np = intrinsic.detach().cpu().numpy()
-
         for m in method_list:
             axes_left = self.retargeter.compute_axes(left_cam, m, axis_len, axis_scale, side="left")
             axes_right = self.retargeter.compute_axes(right_cam, m, axis_len, axis_scale, side="right")
@@ -683,6 +696,11 @@ class HandRetargetPipeline:
 
         intrinsic_np = np.array(all_data["camera"]["intrinsic"], dtype=np.float32)
         out_w, out_h = SAVED_VIDEO_RESOLUTION
+        img_size = all_data.get("camera", {}).get("img_size")
+        if img_size and len(img_size) >= 2:
+            intrinsic_np = scale_intrinsics(
+                intrinsic_np, [int(img_size[0]), int(img_size[1])], [out_w, out_h]
+            )
         pose_dict = all_data["poses"]
         if isinstance(pose_dict.get("left"), list):
             left_poses = pose_dict.get("left", [])
