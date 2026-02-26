@@ -1243,6 +1243,20 @@ def process_single_clip(
     stats_path = os.path.join(clip_dir, "stats.json")
     with open(stats_path, "w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2)
+    
+    meta_path = os.path.join(clip_dir, "meta.json")
+    meta = {}
+    meta["clip_id"] = clip_id
+    meta["json_path"] = json_path
+    meta["video_path"] = video_path
+    meta["n_frames"] = n_frames
+    meta["fps"] = fps
+    meta["camera_intrinsics"] = camera_intrinsics.tolist()
+    meta["img_size"] = img_size
+    meta["robot_info"] = robot_info
+    meta["camera_extrinsics"] = camera_matrix.tolist()
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
 
     # --- Optional render overlay ---
     if do_render:
