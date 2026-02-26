@@ -16,3 +16,6 @@ import numpy as np
 for _name in ("int", "float", "bool", "str", "complex", "object"):
     if not hasattr(np, _name):
         setattr(np, _name, getattr(builtins, _name))
+# Python 3 has no unicode type (str is unicode); deps may still do "from numpy import unicode"
+if not hasattr(np, "unicode"):
+    np.unicode = str
