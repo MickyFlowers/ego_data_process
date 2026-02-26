@@ -14,6 +14,23 @@ from typing import Dict, List, Tuple
 from manopth.manolayer import ManoLayer
 
 
+def _to_json_serializable(obj):
+    """Recursively convert Tensors and ndarrays to lists for JSON."""
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu().tolist()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (list, tuple)):
+        return [_to_json_serializable(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _to_json_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (int, float, str, bool, type(None))):
+        return obj
+    if hasattr(obj, "item"):  # numpy scalar
+        return obj.item()
+    return obj
+
+
 class KeypointsExtractor:
     def __init__(self, model_dir: Path, device: torch.device | None = None,
                  flat_hand_mean: bool = True, fix_shapedirs: bool = True):
@@ -588,10 +605,16 @@ class HandRetargetPipeline:
         left_pinch = self.retargeter.compute_pinch_norm(left_cam)
         right_pinch = self.retargeter.compute_pinch_norm(right_cam)
 
+        fps_val = data.get("fps", 60)
+        if isinstance(fps_val, (torch.Tensor, np.ndarray)):
+            fps_val = int(fps_val.item() if hasattr(fps_val, "item") else float(fps_val))
+        else:
+            fps_val = int(fps_val)
+
         output_data = {
-            'video_path': str((data_path.parent / data_path.stem).with_suffix('.mp4')),
-            'data_path': str(data_path),
-            'fps': data.get('fps', 60),
+            "video_path": str((data_path.parent / data_path.stem).with_suffix(".mp4")),
+            "data_path": str(data_path),
+            "fps": fps_val,
             "camera": {
                 "intrinsic": intrinsic_np.tolist(),
                 "img_size": [
@@ -602,19 +625,21 @@ class HandRetargetPipeline:
             "poses": {},
         }
         num_frames = left_cam.shape[0]
-        
+
         frame_result = {"left": [], "right": []}
         for side in ["left", "right"]:
             pinch = left_pinch if side == "left" else right_pinch
             for t in range(num_frames):
                 origin, axis_angle = poses[(side, m)][t]
-                pose = np.concatenate([origin, axis_angle, [pinch[t]]], axis=0)
+                origin = np.asarray(origin)
+                axis_angle = np.asarray(axis_angle)
+                pose = np.concatenate([origin, axis_angle, [float(pinch[t])]], axis=0)
                 frame_result[side].append(pose.tolist())
         output_data["poses"] = frame_result
 
         if out_path is not None:
             with open(out_path, "w") as f:
-                json.dump(output_data, f, ensure_ascii=False, indent=2)
+                json.dump(_to_json_serializable(output_data), f, ensure_ascii=False, indent=2)
         return output_data
 
     def replay_json(
