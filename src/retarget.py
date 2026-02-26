@@ -16,6 +16,11 @@ from manopth.manolayer import ManoLayer
 # Saved video resolution for both retarget replay and (when aligned) IK overlay; (width, height)
 SAVED_VIDEO_RESOLUTION = (640, 480)
 
+# Gripper (pinch) mapping: use absolute scale so small hand movement is not stretched to full range.
+# Thumb–index distance in meters: below closed -> 1 (closed), above open -> 0 (open).
+PINCH_DIST_CLOSED_M = 0.02
+PINCH_DIST_OPEN_M = 0.10
+
 
 def _to_json_serializable(obj):
     """Recursively convert Tensors and ndarrays to lists for JSON."""
@@ -200,6 +205,9 @@ class EEFRetargeter:
         return poses
 
     def compute_pinch_norm(self, joints_cam: np.ndarray) -> np.ndarray:
+        """Map thumb–index distance to [0,1] with absolute scale (0=open, 1=closed).
+        Uses fixed distance bounds so a small movement range is not stretched to full [0,1].
+        """
         thumb_idx, index_idx = self._get_thumb_index_indices(joints_cam.shape[1])
         n = joints_cam.shape[0]
         dists = np.zeros(n, dtype=np.float32)
@@ -209,11 +217,14 @@ class EEFRetargeter:
             thumb_center = joints_cam[i, thumb_idx].mean(axis=0)
             index_center = joints_cam[i, index_idx].mean(axis=0)
             dists[i] = np.linalg.norm(thumb_center - index_center)
-        dist_max = np.max(dists)
-        dist_min = np.min(dists)
-
-        normed = (dists - dist_min) / (dist_max - dist_min + 1e-6)
-        return normed
+        d_closed = PINCH_DIST_CLOSED_M
+        d_open = PINCH_DIST_OPEN_M
+        # Linear map: dist small (closed) -> 0, dist large (open) -> 1 (matches IK 0=closed, 1=open)
+        span = d_open - d_closed
+        if span <= 0:
+            return np.zeros(n, dtype=np.float32)
+        normed = (dists - d_closed) / span
+        return np.clip(normed, 0.0, 1.0).astype(np.float32)
 
     def _normalize(self, v: np.ndarray, eps: float = 1e-8) -> np.ndarray:
         n = np.linalg.norm(v)
