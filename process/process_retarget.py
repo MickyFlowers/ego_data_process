@@ -196,9 +196,7 @@ def main():
             elapsed = time.time() - t_start
             print(f"[Batch] {n_done}/{n_total} ({elapsed:.0f}s)")
 
-    ray.shutdown()
-
-    # Summary
+    # Summary (write before shutdown)
     total_time = time.time() - t_start
     success_results = [r for r in results if "error" not in r]
     total_frames = sum(r.get("n_frames", 0) for r in success_results)
@@ -215,11 +213,14 @@ def main():
         "total_frames": total_frames,
         "avg_time_per_frame": total_time / total_frames if total_frames > 0 else 0,
     }
+    os.makedirs(args.output_dir, exist_ok=True)
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
     print(f"[Batch] Done: {summary['success']}/{n_total} ok, {summary['failed']} failed | "
           f"{total_time:.0f}s, {total_frames} frames, {summary_path}")
+
+    ray.shutdown()
 
     if failed_list:
         print("\n[Batch] Failed clips:", file=sys.stderr)
