@@ -18,7 +18,7 @@ SAVED_VIDEO_RESOLUTION = (640, 480)
 
 # Gripper (pinch) mapping: absolute scale + nonlinear curve (more sensitivity when hand is nearly closed).
 # Thumb–index distance in meters.
-PINCH_DIST_CLOSED_M = 0.02
+PINCH_DIST_CLOSED_M = 0.05
 PINCH_DIST_OPEN_M = 0.10
 # Power exponent for nonlinear map: output = linear^gamma. gamma < 1 => small distance changes enlarge gripper more.
 PINCH_GAMMA = 0.5
