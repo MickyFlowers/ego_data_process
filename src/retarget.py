@@ -12,6 +12,8 @@ from scipy.spatial.transform import Rotation as Rscipy
 from typing import Dict, List, Tuple
 
 from manopth.manolayer import ManoLayer
+import h5py
+
 
 # Saved video resolution for both retarget replay and (when aligned) IK overlay; (width, height)
 SAVED_VIDEO_RESOLUTION = (640, 480)
@@ -768,13 +770,338 @@ class HandRetargetPipeline:
             print(f"Wrote {written} frames (sample_ratio={sample_ratio}) to {out_path}")
 
 
+class EgoDexExtractor:
+    """Extract 21-joint hand keypoints from EgoDex HDF5 (transforms + confidences)."""
+
+    # Maps to MANO 21-joint order: wrist, thumb×4, index×4, middle×4, ring×4, little×4
+    _JOINT_SUFFIXES: List[str] = [
+        "Hand",
+        "ThumbKnuckle", "ThumbIntermediateBase", "ThumbIntermediateTip", "ThumbTip",
+        "IndexFingerKnuckle", "IndexFingerIntermediateBase", "IndexFingerIntermediateTip", "IndexFingerTip",
+        "MiddleFingerKnuckle", "MiddleFingerIntermediateBase", "MiddleFingerIntermediateTip", "MiddleFingerTip",
+        "RingFingerKnuckle", "RingFingerIntermediateBase", "RingFingerIntermediateTip", "RingFingerTip",
+        "LittleFingerKnuckle", "LittleFingerIntermediateBase", "LittleFingerIntermediateTip", "LittleFingerTip",
+    ]
+
+    def __init__(self, device: torch.device | None = None, confidence_threshold: float = 0.3):
+        if device is not None:
+            self.device = device
+        elif torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
+        self.confidence_threshold = confidence_threshold
+
+    def load_data(self, data_path: Path) -> Dict:
+        with h5py.File(data_path, "r") as f:
+            data: Dict = {
+                "intrinsic": np.array(f["camera/intrinsic"], dtype=np.float32),
+                "camera_transforms": np.array(f["transforms/camera"], dtype=np.float32),
+            }
+            for side in ("left", "right"):
+                joints = self._read_hand_joints(f, side)
+                data[f"{side}_joints"] = joints
+        return data
+
+    def extract(self, data: Dict) -> Dict:
+        intrinsic = data["intrinsic"]
+        cam_T = data["camera_transforms"]
+
+        fx, fy = float(intrinsic[0, 0]), float(intrinsic[1, 1])
+        cx, cy = float(intrinsic[0, 2]), float(intrinsic[1, 2])
+        img_focal = (fx + fy) * 0.5
+        img_center = np.array([cx, cy], dtype=np.float32)
+
+        traj = self._cam_transforms_to_traj(cam_T)
+
+        dev = self.device
+        thresh = self.confidence_threshold
+
+        sides: Dict = {}
+        for side in ("left", "right"):
+            joints = data[f"{side}_joints"]
+            sides[side] = {
+                "keypoints3d": torch.from_numpy(joints).float().to(dev),
+                "valid": torch.ones(joints.shape[0], dtype=torch.float32, device=dev),
+            }
+
+        return {
+            **sides,
+            "camera": {
+                "traj": torch.from_numpy(traj).float().to(dev),
+                "img_focal": torch.tensor(img_focal, dtype=torch.float32, device=dev),
+                "img_center": torch.from_numpy(img_center).to(dev),
+                "scale": torch.tensor(1.0, dtype=torch.float32, device=dev),
+            },
+        }
+
+    def _read_hand_joints(self, f: h5py.File, side: str) -> Tuple[np.ndarray, np.ndarray]:
+        names = [f"{side}{s}" for s in self._JOINT_SUFFIXES]
+        n_frames = f[f"transforms/{names[0]}"].shape[0]
+        n_joints = len(names)
+
+        joints = np.empty((n_frames, n_joints, 3), dtype=np.float32)
+
+        for j, name in enumerate(names):
+            joints[:, j] = np.array(f[f"transforms/{name}"], dtype=np.float32)[:, :3, 3]
+
+        return joints
+
+    @staticmethod
+    def _cam_transforms_to_traj(cam_T: np.ndarray) -> np.ndarray:
+        """(N,4,4) camera-to-world transforms -> (N,7) [tx,ty,tz, qx,qy,qz,qw]."""
+        n = cam_T.shape[0]
+        traj = np.empty((n, 7), dtype=np.float32)
+        traj[:, :3] = cam_T[:, :3, 3]
+        traj[:, 3:] = Rscipy.from_matrix(cam_T[:, :3, :3]).as_quat().astype(np.float32)
+        return traj
+
+    
+
+
+class EgoDexRetargetPipeline:
+    def __init__(self, device: torch.device | None = None):
+        self.extractor = EgoDexExtractor(device)
+        self.projector = CameraProjector(device)
+        self.retargeter = EEFRetargeter()
+        self.visualizer = HandVisualizer()
+
+    def render_video(
+        self,
+        data_path: Path,
+        video_path: Path,
+        out_path: Path,
+        methods: str = "pinch,palm,pca",
+        axis_len: float = 0.0,
+        axis_scale: float = 0.6,
+        draw_kps: bool = False,
+    ):
+        data = self.extractor.load_data(data_path)
+        result = self.extractor.extract(data)
+
+        left_world = result["left"]["keypoints3d"]
+        right_world = result["right"]["keypoints3d"]
+        left_valid_t = result["left"]["valid"]
+        right_valid_t = result["right"]["valid"]
+
+        traj = self.projector.apply_scale(result["camera"]["traj"], result["camera"]["scale"])
+        intrinsic = self.projector.build_intrinsic(result["camera"]["img_focal"], result["camera"]["img_center"])
+        img_size = result["camera"]["img_center"] * 2
+        s0 = img_size[0].item() if hasattr(img_size[0], "item") else float(img_size[0])
+        s1 = img_size[1].item() if hasattr(img_size[1], "item") else float(img_size[1])
+        src_size = [int(round(s0)), int(round(s1))]
+        intrinsic_np = scale_intrinsics(
+            intrinsic.detach().cpu().numpy(), src_size, list(SAVED_VIDEO_RESOLUTION)
+        )
+
+        left_cam_t = self.projector.world_to_camera(left_world, traj)
+        right_cam_t = self.projector.world_to_camera(right_world, traj)
+        left_cam = left_cam_t.detach().cpu().numpy()
+        right_cam = right_cam_t.detach().cpu().numpy()
+        left_img = self.projector.project_np(left_cam, intrinsic_np)
+        right_img = self.projector.project_np(right_cam, intrinsic_np)
+
+        left_valid = left_valid_t.detach().cpu().numpy().astype(bool)
+        right_valid = right_valid_t.detach().cpu().numpy().astype(bool)
+
+        method_list = [m.strip() for m in methods.split(",") if m.strip()] or ["pinch"]
+        axes_uv_left = {}
+        axes_uv_right = {}
+        for m in method_list:
+            axes_left = self.retargeter.compute_axes(left_cam, m, axis_len, axis_scale, side="left")
+            axes_right = self.retargeter.compute_axes(right_cam, m, axis_len, axis_scale, side="right")
+            axes_uv_left[m] = self.projector.project_np(axes_left, intrinsic_np)
+            axes_uv_right[m] = self.projector.project_np(axes_right, intrinsic_np)
+
+        self.visualizer.render_video(
+            video_path,
+            out_path,
+            left_img,
+            right_img,
+            left_valid,
+            right_valid,
+            axes_uv_left,
+            axes_uv_right,
+            method_list,
+            SAVED_VIDEO_RESOLUTION,
+            draw_kps,
+        )
+    
+    def retarget(self, data_path: Path, methods="pinch_plane", out_path=None, verbose: bool = True):
+        """
+        Retarget input result; save trajectory as 6D pose (position + axis_angle) to out_path.
+        No video rendering. Per frame: both hands, each method: position and rotation(axis_angle).
+        """
+        data = self.extractor.load_data(data_path)
+        if verbose:
+            print(data.keys())
+        result = self.extractor.extract(data)
+        left_world = result["left"]["keypoints3d"]
+        right_world = result["right"]["keypoints3d"]
+
+        traj = self.projector.apply_scale(result["camera"]["traj"], result["camera"]["scale"])
+        intrinsic = self.projector.build_intrinsic(
+            result["camera"]["img_focal"], result["camera"]["img_center"]
+        )
+        intrinsic_np = intrinsic.detach().cpu().float().numpy()
+        img_center = result["camera"]["img_center"].detach().cpu().numpy()
+
+        left_cam = self.projector.world_to_camera(left_world, traj).detach().cpu().numpy()
+        right_cam = self.projector.world_to_camera(right_world, traj).detach().cpu().numpy()
+
+        method_list = [m.strip() for m in methods.split(",") if m.strip()] or ["pinch"]
+
+        poses = {}
+        for side, cam_data in [("left", left_cam), ("right", right_cam)]:
+            for m in method_list:
+                poses[(side, m)] = self.retargeter.compute_poses(cam_data, m, side=side)
+
+        left_pinch = self.retargeter.compute_pinch_norm(left_cam)
+        right_pinch = self.retargeter.compute_pinch_norm(right_cam)
+        
+        fps_val = data.get("fps", 30)
+        if isinstance(fps_val, (torch.Tensor, np.ndarray)):
+            fps_val = int(fps_val.item() if hasattr(fps_val, "item") else float(fps_val))
+        else:
+            fps_val = int(fps_val)
+
+        output_data = {
+            "video_path": str((data_path.parent / data_path.stem).with_suffix(".mp4")),
+            "data_path": str(data_path),
+            "fps": fps_val,
+            "camera": {
+                "intrinsic": intrinsic_np.tolist(),
+                "img_size": [
+                    int(round(float(img_center[0] * 2))),
+                    int(round(float(img_center[1] * 2))),
+                ],
+            },
+            "poses": {},
+        }
+        num_frames = left_cam.shape[0]
+
+        frame_result = {"left": [], "right": []}
+        for side in ["left", "right"]:
+            pinch = left_pinch if side == "left" else right_pinch
+            for t in range(num_frames):
+                origin, axis_angle = poses[(side, m)][t]
+                origin = np.asarray(origin)
+                axis_angle = np.asarray(axis_angle)
+                pose = np.concatenate([origin, axis_angle, [float(pinch[t])]], axis=0)
+                frame_result[side].append(pose.tolist())
+        output_data["poses"] = frame_result
+
+        if out_path is not None:
+            with open(out_path, "w") as f:
+                json.dump(_to_json_serializable(output_data), f, ensure_ascii=False, indent=2)
+        return output_data
+
+    def replay_json(
+        self,
+        json_path: Path,
+        out_path: Path,
+        video_path: Path | None = None,
+        axis_len: float = 0.03,
+        sample_ratio: float = 1.0,
+        verbose: bool = True,
+    ):
+        """Load retarget JSON (camera intrinsics + video_path), project 6D poses onto video and write.
+        If video_path not given, read from JSON video_path field; sample_ratio in (0,1] controls frame sampling.
+        """
+        with open(json_path, "r") as f:
+            all_data = json.load(f)
+
+        if video_path is None:
+            video_path = all_data.get("video_path") or (
+                str(Path(all_data.get("data_path", "")).with_suffix(".mp4"))
+            )
+            if not video_path:
+                raise ValueError("JSON has no video_path/data_path; pass video_path")
+            video_path = Path(video_path)
+        else:
+            video_path = Path(video_path)
+
+        intrinsic_np = np.array(all_data["camera"]["intrinsic"], dtype=np.float32)
+        out_w, out_h = SAVED_VIDEO_RESOLUTION
+        img_size = all_data.get("camera", {}).get("img_size")
+        if img_size and len(img_size) >= 2:
+            intrinsic_np = scale_intrinsics(
+                intrinsic_np, [int(img_size[0]), int(img_size[1])], [out_w, out_h]
+            )
+        pose_dict = all_data["poses"]
+        if isinstance(pose_dict.get("left"), list):
+            left_poses = pose_dict.get("left", [])
+            right_poses = pose_dict.get("right", [])
+        else:
+            method_key = next(iter(pose_dict), None)
+            sub = pose_dict[method_key] if method_key else {}
+            left_poses = sub.get("left", [])
+            right_poses = sub.get("right", [])
+
+        reader = imageio.get_reader(str(video_path))
+        fps = all_data.get("fps", 30)
+
+        step = max(1, round(1.0 / max(1e-6, min(1.0, float(sample_ratio)))))
+        writer = imageio.get_writer(str(out_path), fps=fps, codec="libx264", macro_block_size=1)
+
+        axis_colors = {"x": (0, 0, 255), "y": (0, 255, 0), "z": (255, 0, 0)}
+        side_origin_colors = {"left": (255, 255, 0), "right": (0, 255, 255)}
+
+        side_poses = {"left": left_poses, "right": right_poses}
+        num_poses = max(len(left_poses), len(right_poses))
+        written = 0
+
+        for frame_idx, frame in enumerate(reader):
+            if frame_idx >= num_poses:
+                break
+            if frame_idx % step != 0:
+                continue
+            # Always resize to SAVED_VIDEO_RESOLUTION for consistent output
+            if frame.shape[1] != out_w or frame.shape[0] != out_h:
+                frame = cv2.resize(frame, (out_w, out_h))
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            pose_idx = frame_idx
+
+            for side in ["left", "right"]:
+                poses_list = side_poses[side]
+                if pose_idx >= len(poses_list):
+                    continue
+                pose_vec = np.array(poses_list[pose_idx], dtype=np.float32)
+                origin = pose_vec[:3]
+                aa = pose_vec[3:6]
+                R = Rscipy.from_rotvec(aa).as_matrix().astype(np.float32)
+
+                pts_3d = np.stack([
+                    origin,
+                    origin + axis_len * R[:, 0],
+                    origin + axis_len * R[:, 1],
+                    origin + axis_len * R[:, 2],
+                ])
+                pts_2d = self.projector.project_np(pts_3d, intrinsic_np)
+
+                ox, oy = int(pts_2d[0, 0]), int(pts_2d[0, 1])
+                for name, k in zip(["x", "y", "z"], [1, 2, 3]):
+                    ex, ey = int(pts_2d[k, 0]), int(pts_2d[k, 1])
+                    cv2.line(frame_bgr, (ox, oy), (ex, ey), axis_colors[name], 2)
+                    cv2.circle(frame_bgr, (ex, ey), 3, axis_colors[name], -1)
+                cv2.circle(frame_bgr, (ox, oy), 4, side_origin_colors[side], -1)
+
+            writer.append_data(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+            written += 1
+
+        reader.close()
+        writer.close()
+        if verbose:
+            print(f"Wrote {written} frames (sample_ratio={sample_ratio}) to {out_path}")
+
+
+
 if __name__ == "__main__":
 
-    retarget = HandRetargetPipeline(model_dir="/home/cyx/projects/ego_overlay/assets/mano_v1_2/models")
-    retarget.retarget(data_path=Path("/home/cyx/projects/ego-centric") / "P04_12_364_00043.pose3d_hand", methods="pinch_plane", out_path="/home/cyx/projects/test_ik/outputs/P04_12_364_00043_retarget.json")
+    retarget = EgoDexRetargetPipeline(device=torch.device("cpu"))
+    retarget.retarget(data_path=Path("/home/ss-oss1/data/dataset/egocentric/ml-egodex/download/part1/color") / "1.hdf5", methods="pinch_plane", out_path="./outputs/egodex/color_1.json")
     # retarget.render_video(data_path="/home/cyx/projects/ego-centric/P04_12_364_00043.pose3d_hand", video_path="/home/cyx/projects/ego-centric/P04_12_364_00043.mp4", out_path="/home/cyx/projects/test_ik/outputs/P04_12_364_00043_retarget.mp4", methods="pinch_plane", axis_len=0.0, axis_scale=0.6, draw_kps=True)
     retarget.replay_json(
-        json_path=Path("/home/cyx/projects/test_ik/outputs/P04_12_364_00043_retarget.json"),
-        out_path=Path("/home/cyx/projects/test_ik/outputs/P04_12_364_00043_retarget_replay.mp4"),
-        sample_ratio=0.1,
+        json_path=Path("./outputs/egodex/color_1.json"),
+        out_path=Path("./outputs/egodex/color_1.mp4"),
     )

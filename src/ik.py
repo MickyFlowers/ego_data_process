@@ -92,9 +92,10 @@ def quat_distance(q1: np.ndarray | tuple, q2: np.ndarray | tuple) -> float:
 # -----------------------------------------------------------------------------
 # Pose data loading and alignment
 # -----------------------------------------------------------------------------
-def get_default_camera_matrix() -> np.ndarray:
-    """Default camera 4x4 matrix (rotation and origin only)."""
-    rot = R.from_euler("ZXZ", [-90, -135, 0.0], degrees=True).as_matrix()
+def get_default_camera_matrix(camera_elevation_deg: float = 45.0) -> np.ndarray:
+    """Default camera 4x4 matrix (rotation and origin only).
+    camera_elevation_deg: 俯视角（度），默认 45，表示相机从水平面向下看的夹角。"""
+    rot = R.from_euler("ZXZ", [-90, -90 - camera_elevation_deg, 0.0], degrees=True).as_matrix()
     T = np.eye(4)
     T[:3, :3] = rot
     return T
@@ -212,6 +213,7 @@ def load_pose_data_from_json(
     workstation_center: np.ndarray | None = None,
     use_ekf: bool = True,
     use_gripper_kf: bool = True,
+    camera_elevation_deg: float = 45.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, dict, np.ndarray, np.ndarray, np.ndarray, list, str | None]:
     """
     Load poses from JSON and apply alignment and filtering.
@@ -258,7 +260,7 @@ def load_pose_data_from_json(
     left_gripper = left_gripper[:n_common]
     right_gripper = right_gripper[:n_common]
 
-    cam = get_default_camera_matrix()
+    cam = get_default_camera_matrix(camera_elevation_deg=camera_elevation_deg)
     left_T, right_T = build_pose_matrices(left_poses, right_poses, cam)
     left_T, right_T, cam = align_poses_to_workstation(
         left_T, right_T, workstation_center, cam
@@ -1139,6 +1141,7 @@ def process_single_clip(
     use_gui: bool = False,
     urdf_path: str = "",
     verbose: bool = True,
+    camera_elevation_deg: float = 45.0,
 ) -> dict:
     """
     Process single clip: IK solve -> Joint KF -> error stats -> save.
@@ -1160,7 +1163,10 @@ def process_single_clip(
         left_pose_matrix, right_pose_matrix, camera_matrix,
         fps, _, left_gripper, right_gripper,
         camera_intrinsics, img_size, video_path,
-    ) = load_pose_data_from_json(json_path, use_ekf=True, use_gripper_kf=True)
+    ) = load_pose_data_from_json(
+        json_path, use_ekf=True, use_gripper_kf=True,
+        camera_elevation_deg=camera_elevation_deg,
+    )
 
     n_frames = min(
         left_pose_matrix.shape[0], right_pose_matrix.shape[0],

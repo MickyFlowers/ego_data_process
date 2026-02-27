@@ -34,7 +34,10 @@ import ray
 
 
 @ray.remote
-def process_clip_remote(json_path: str, output_dir: str, do_render: bool, urdf_path: str) -> dict:
+def process_clip_remote(
+    json_path: str, output_dir: str, do_render: bool, urdf_path: str,
+    camera_elevation_deg: float = 45.0,
+) -> dict:
     """Ray remote: each worker initializes PyBullet (DIRECT) and processes one clip."""
     from src.ik import process_single_clip
     return process_single_clip(
@@ -44,6 +47,7 @@ def process_clip_remote(json_path: str, output_dir: str, do_render: bool, urdf_p
         use_gui=False,
         urdf_path=urdf_path,
         verbose=False,
+        camera_elevation_deg=camera_elevation_deg,
     )
 
 
@@ -57,6 +61,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed for sampling")
     parser.add_argument("--render-resolution", type=list[int], default=[640, 480], help="Render resolution")
     parser.add_argument("--urdf-path", type=str, default="./assets/aloha_new_description/urdf/dual_piper.urdf", help="URDF path")
+    parser.add_argument("--camera-elevation", type=float, default=45.0, dest="camera_elevation_deg",
+                        help="相机俯视角（度），默认 45")
     args = parser.parse_args()
 
     json_files = sorted(glob.glob(os.path.join(args.input_dir, "*.json")))
@@ -100,6 +106,7 @@ def main():
         do_render = i in sample_indices
         futures.append(process_clip_remote.options(**task_options).remote(
             jp, args.output_dir, do_render, args.urdf_path,
+            args.camera_elevation_deg,
         ))
         clip_ids.append(cid)
 
