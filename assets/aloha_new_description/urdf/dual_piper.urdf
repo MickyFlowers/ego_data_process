@@ -16,7 +16,7 @@
         <visual>
             <origin xyz="0 0 0" rpy="0 0 0" />
             <geometry>
-                <mesh filename="package://aloha_new_description/meshes/dark_dae/base_link.dae" />
+                <mesh filename="package://aloha_new_description/meshes/dark_dae/base_link.obj" />
             </geometry>
         </visual>
         <collision>
@@ -41,7 +41,7 @@
         <visual>
             <origin xyz="0 0 0" rpy="0 0 0" />
             <geometry>
-                <mesh filename="package://aloha_new_description/meshes/dark_dae/link1.dae" />
+                <mesh filename="package://aloha_new_description/meshes/dark_dae/link1.obj" />
             </geometry>
         </visual>
         <collision>
@@ -67,7 +67,7 @@
         <visual>
             <origin xyz="0 0 0" rpy="0 0 0" />
             <geometry>
-                <mesh filename="package://aloha_new_description/meshes/dark_dae/link2.dae" />
+                <mesh filename="package://aloha_new_description/meshes/dark_dae/link2.obj" />
             </geometry>
         </visual>
         <collision>
@@ -93,7 +93,7 @@
         <visual>
             <origin xyz="0 0 0" rpy="0 0 0" />
             <geometry>
-                <mesh filename="package://aloha_new_description/meshes/dark_dae/link3.dae" />
+                <mesh filename="package://aloha_new_description/meshes/dark_dae/link3.obj" />
             </geometry>
         </visual>
         <collision>
@@ -119,7 +119,7 @@
         <visual>
             <origin xyz="0 0 0" rpy="0 0 0" />
             <geometry>
-                <mesh filename="package://aloha_new_description/meshes/dark_dae/link4.dae" />
+                <mesh filename="package://aloha_new_description/meshes/dark_dae/link4.obj" />
             </geometry>
         </visual>
         <collision>
@@ -145,7 +145,7 @@
         <visual>
             <origin xyz="0 0 0" rpy="0 0 -3.14" />
             <geometry>
-                <mesh filename="package://aloha_new_description/meshes/dark_dae/link5.dae" />
+                <mesh filename="package://aloha_new_description/meshes/dark_dae/link5.obj" />
             </geometry>
         </visual>
         <collision>
@@ -171,13 +171,13 @@
         <visual>
             <origin xyz="0 0 0" rpy="0 0 0" />
             <geometry>
-                <mesh filename="package://aloha_new_description/meshes/dark_dae/link6_.dae" />
+                <mesh filename="package://aloha_new_description/meshes/dark_dae/link6_.obj" />
             </geometry>
         </visual>
         <collision>
             <origin xyz="0 0 0" rpy="0 0 0" />
             <geometry>
-                <mesh filename="package://aloha_new_description/meshes/piper_slave_meshes/link6_v2.dae" />
+                <mesh filename="package://aloha_new_description/meshes/piper_slave_meshes/link6_v2.obj" />
             </geometry>
         </collision>
     </link>
@@ -209,13 +209,13 @@
         <visual>
             <origin xyz="-0.0025 0 0" rpy="0 0 0" />
             <geometry>
-                <mesh filename="package://aloha_new_description/meshes/dark_dae/d435_camera_stand.dae" />
+                <mesh filename="package://aloha_new_description/meshes/dark_dae/d435_camera_stand.obj" />
             </geometry>
         </visual>
         <collision>
             <origin xyz="0 0 0" rpy="0 0 0" />
             <geometry>
-                <mesh filename="package://aloha_new_description/meshes/dark_dae/d435_camera_stand.dae" />
+                <mesh filename="package://aloha_new_description/meshes/dark_dae/d435_camera_stand.obj" />
             </geometry>
         </collision>
     </link>
@@ -240,7 +240,7 @@
         <visual>
             <origin rpy="0.0 0.0 0.0" xyz="0.0043 0.0 0" />
             <geometry>
-                <mesh filename="package://realsense2_description/meshes/d435.dae" />
+                <mesh filename="package://realsense2_description/meshes/d435.obj" />
             </geometry>
         </visual>
         <collision>
@@ -269,7 +269,7 @@
         <visual>
             <origin xyz="0 0 0" rpy="0 0 0" />
             <geometry>
-                <mesh filename="package://aloha_new_description/meshes/dark_dae/link7.dae" />
+                <mesh filename="package://aloha_new_description/meshes/dark_dae/link7.obj" />
             </geometry>
             <material name="">
                 <color rgba="0.06 0.06 0.06 1" />
@@ -298,7 +298,7 @@
         <visual>
             <origin xyz="0 0 0" rpy="0 0 0" />
             <geometry>
-                <mesh filename="package://aloha_new_description/meshes/dark_dae/link8.dae" />
+                <mesh filename="package://aloha_new_description/meshes/dark_dae/link8.obj" />
             </geometry>
             <material name="">
                 <color rgba="0.06 0.06 0.06 1" />
@@ -327,7 +327,7 @@
         <visual>
             <origin xyz="0 0 0" rpy="0 0 0" />
             <geometry>
-                <mesh filename="package://aloha_new_description/meshes/dark_dae/base_link.dae" />
+                <mesh filename="package://aloha_new_description/meshes/dark_dae/base_link.obj" />
             </geometry>
         </visual>
         <collision>
@@ -352,7 +352,7 @@
         <visual>
             <origin xyz="0 0 0" rpy="0 0 0" />
             <geometry>
-                <mesh filename="package://aloha_new_description/meshes/dark_dae/link1.dae" />
+                <mesh filename="package://aloha_new_description/meshes/dark_dae/link1.obj" />
             </geometry>
         </visual>
         <collision>
@@ -378,7 +378,7 @@
         <visual>
             <origin xyz="0 0 0" rpy="0 0 0" />
             <geometry>
-                <mesh filename="package://aloha_new_description/meshes/dark_dae/link2.dae" />
+                <mesh filename="package://aloha_new_description/meshes/dark_dae/link2.obj" />
             </geometry>
         </visual>
         <collision>
@@ -404,7 +404,7 @@
         <visual>
             <origin xyz="0 0 0" rpy="0 0 0" />
             <geometry>
-                <mesh filename="package://aloha_new_description/meshes/dark_dae/link3.dae" />
+                <mesh filename="package://aloha_new_description/meshes/dark_dae/link3.obj" />
             </geometry>
         </visual>
         <collision>
@@ -430,7 +430,7 @@
         <visual>
             <origin xyz="0 0 0" rpy="0 0 0" />
             <geometry>
-                <mesh filename="package://aloha_new_description/meshes/dark_dae/link4.dae" />
+                <mesh filename="package://aloha_new_description/meshes/dark_dae/link4.obj" />
             </geometry>
         </visual>
         <collision>
@@ -456,7 +456,7 @@
         <visual>
             <origin xyz="0 0 0" rpy="0 0 -3.14" />
             <geometry>
-                <mesh filename="package://aloha_new_description/meshes/dark_dae/link5.dae" />
+                <mesh filename="package://aloha_new_description/meshes/dark_dae/link5.obj" />
             </geometry>
         </visual>
         <collision>
@@ -482,13 +482,13 @@
         <visual>
             <origin xyz="0 0 0" rpy="0 0 0" />
             <geometry>
-                <mesh filename="package://aloha_new_description/meshes/dark_dae/link6_.dae" />
+                <mesh filename="package://aloha_new_description/meshes/dark_dae/link6_.obj" />
             </geometry>
         </visual>
         <collision>
             <origin xyz="0 0 0" rpy="0 0 0" />
             <geometry>
-                <mesh filename="package://aloha_new_description/meshes/piper_slave_meshes/link6_v2.dae" />
+                <mesh filename="package://aloha_new_description/meshes/piper_slave_meshes/link6_v2.obj" />
             </geometry>
         </collision>
     </link>
@@ -520,13 +520,13 @@
         <visual>
             <origin xyz="-0.0025 0 0" rpy="0 0 0" />
             <geometry>
-                <mesh filename="package://aloha_new_description/meshes/dark_dae/d435_camera_stand.dae" />
+                <mesh filename="package://aloha_new_description/meshes/dark_dae/d435_camera_stand.obj" />
             </geometry>
         </visual>
         <collision>
             <origin xyz="0 0 0" rpy="0 0 0" />
             <geometry>
-                <mesh filename="package://aloha_new_description/meshes/dark_dae/d435_camera_stand.dae" />
+                <mesh filename="package://aloha_new_description/meshes/dark_dae/d435_camera_stand.obj" />
             </geometry>
         </collision>
     </link>
@@ -551,7 +551,7 @@
         <visual>
             <origin rpy="0.0 0.0 0.0" xyz="0.0043 0.0 0" />
             <geometry>
-                <mesh filename="package://realsense2_description/meshes/d435.dae" />
+                <mesh filename="package://realsense2_description/meshes/d435.obj" />
             </geometry>
         </visual>
         <collision>
@@ -580,7 +580,7 @@
         <visual>
             <origin xyz="0 0 0" rpy="0 0 0" />
             <geometry>
-                <mesh filename="package://aloha_new_description/meshes/dark_dae/link7.dae" />
+                <mesh filename="package://aloha_new_description/meshes/dark_dae/link7.obj" />
             </geometry>
             <material name="">
                 <color rgba="0.06 0.06 0.06 1" />
@@ -609,7 +609,7 @@
         <visual>
             <origin xyz="0 0 0" rpy="0 0 0" />
             <geometry>
-                <mesh filename="package://aloha_new_description/meshes/dark_dae/link8.dae" />
+                <mesh filename="package://aloha_new_description/meshes/dark_dae/link8.obj" />
             </geometry>
             <material name="">
                 <color rgba="0.06 0.06 0.06 1" />
