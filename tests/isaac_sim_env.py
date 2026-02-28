@@ -576,8 +576,19 @@ class IsaacSimEnv:
         self._world.step(render=True)
         import omni.replicator.core as rep
 
-        rep.orchestrator.step(rt_subframes=1)
+        # rep.orchestrator.step(rt_subframes=1)
         rgb = self._rgb_annotator.get_data()
+        if isinstance(rgb, dict):
+            rgb = rgb.get("data", rgb)
+        rgb = np.asarray(rgb)
+        if rgb.size == 0:
+            return None
+        if rgb.ndim == 1:
+            from isaacsim.core.utils.render_product import get_resolution
+
+            rp_path = getattr(self._render_product, "path", self._render_product)
+            w, h = get_resolution(rp_path)
+            rgb = rgb.reshape(h, w, 4)
         seg_data = self._seg_annotator.get_data()
         seg_arr = seg_data["data"] if isinstance(seg_data, dict) else seg_data
         seg_mask = (seg_arr > 0).astype(np.uint8) if np.issubdtype(seg_arr.dtype, np.integer) else seg_arr
@@ -751,6 +762,11 @@ def _render_single_clip(env: IsaacSimEnv, data_dir: str, opts: argparse.Namespac
             result = env.render_frame(left_q, right_q)
             if result is not None:
                 rgb, seg = result
+                rgb = np.asarray(rgb)
+                if rgb.size == 0:
+                    continue
+                if rgb.ndim == 1:
+                    rgb = rgb.reshape(render_h_actual, render_w, 4)
                 robot_rgb = np.asarray(rgb[:, :, :3], dtype=np.uint8)
                 mask = (seg > 0).astype(np.uint8)
                 if needs_resize and (robot_rgb.shape[0], robot_rgb.shape[1]) != (render_h, render_w):
@@ -954,6 +970,7 @@ def _run_ray_batch(args: argparse.Namespace, clip_dirs: list[str]) -> None:
         fut = actor.process_clips.remote(clips, args.output_dir, w)
         futures.append((fut, w, actor))
 
+    t_batch_start = time.time()
     all_results = []
     for fut, w, actor in futures:
         try:
@@ -968,17 +985,25 @@ def _run_ray_batch(args: argparse.Namespace, clip_dirs: list[str]) -> None:
         except Exception:
             pass
 
+    t_batch_elapsed = time.time() - t_batch_start
+    total_frames = sum(r.get("n_frames", 0) for r in all_results if "error" not in r)
+    parallel_fps = total_frames / t_batch_elapsed if t_batch_elapsed > 0 else 0.0
+
     summary = {
         "total": len(clip_dirs),
         "success": sum(1 for r in all_results if "error" not in r),
         "failed": sum(1 for r in all_results if "error" in r),
+        "total_frames": total_frames,
+        "wall_clock_seconds": round(t_batch_elapsed, 2),
+        "parallel_fps": round(parallel_fps, 2),
         "clips": all_results,
     }
     summary_path = os.path.join(args.output_dir, "render_stats.json")
     os.makedirs(args.output_dir, exist_ok=True)
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
-    print(f"[IsaacSim] Done: {summary['success']}/{summary['total']} ok -> {summary_path}")
+    print(f"[IsaacSim] Done: {summary['success']}/{summary['total']} ok, "
+          f"{total_frames} frames in {t_batch_elapsed:.1f}s -> {parallel_fps:.1f} parallel FPS -> {summary_path}")
     ray.shutdown()
 
 
