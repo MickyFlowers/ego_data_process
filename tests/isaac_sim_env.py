@@ -681,6 +681,7 @@ def _filter_pending_clips(clip_dirs: list[str], output_dir: str, verify_video: b
             print(flush=True)
         it = it()
 
+    n_invalid = 0
     for data_dir, out_path in it:
         try:
             import imageio
@@ -695,8 +696,9 @@ def _filter_pending_clips(clip_dirs: list[str], output_dir: str, verify_video: b
             except OSError:
                 pass
             pending.append(data_dir)
+            n_invalid += 1
 
-    print(f"[IsaacSim] Verify done: {len(to_verify) - len([d for d, _ in to_verify if d in pending])} ok, {len(pending)} to render", flush=True)
+    print(f"[IsaacSim] Verify done: {len(to_verify) - n_invalid} ok (skip), {n_invalid} deleted (re-render), {len(pending)} to render", flush=True)
     return pending
 
 
