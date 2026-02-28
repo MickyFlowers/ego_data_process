@@ -644,14 +644,7 @@ def _filter_pending_clips(clip_dirs: list[str], output_dir: str, verify_video: b
     video_dir = os.path.abspath(os.path.join(output_dir, "video"))
     print(f"[IsaacSim] Output video dir: {video_dir}", flush=True)
 
-    clip_id_to_dir = {}
-    for d in clip_dirs:
-        try:
-            with open(os.path.join(d, "meta.json")) as f:
-                cid = json.load(f).get("clip_id", os.path.basename(d.rstrip("/")))
-        except Exception:
-            cid = os.path.basename(d.rstrip("/"))
-        clip_id_to_dir[cid] = d
+    clip_id_to_dir = {os.path.basename(d.rstrip("/")): d for d in clip_dirs}
 
     if not os.path.isdir(video_dir):
         print(f"[IsaacSim] {len(clip_dirs)} to render (no output dir yet)", flush=True)
