@@ -675,18 +675,10 @@ def _filter_pending_clips(clip_dirs: list[str], output_dir: str, verify_video: b
     skip_ok = set()
     if to_verify and verify_video:
         print(f"[IsaacSim] Verifying {len(to_verify)} videos in {video_dir}", flush=True)
-        try:
-            it = tqdm(to_verify, desc="Verify videos", unit="clip", file=sys.stdout)
-        except ImportError:
-            n_total = len(to_verify)
-            def it():
-                for i, x in enumerate(to_verify):
-                    print(f"\r[IsaacSim] Verify: {i + 1}/{n_total}", end="", flush=True)
-                    yield x
-                print(flush=True)
-            it = it()
-
-        for clip_id, out_path in it:
+        n_total = len(to_verify)
+        for i, (clip_id, out_path) in enumerate(to_verify):
+            if (i + 1) % 10 == 0 or i == 0 or i == n_total - 1:
+                print(f"\r[IsaacSim] Verify: {i + 1}/{n_total}", end="", flush=True)
             try:
                 import imageio
                 r = imageio.get_reader(out_path)
@@ -1210,4 +1202,4 @@ if __name__ == "__main__":
                 json.dump(summary, f, indent=2)
             print(f"[IsaacSim] Done: {summary['success']}/{summary['total']} ok, "
                   f"{total_frames} frames in {t_elapsed:.1f}s -> {summary_path}", flush=True)
-        env.close()
+    env.close()
