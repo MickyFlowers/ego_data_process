@@ -634,55 +634,54 @@ def _gather_clip_dirs(input_dir: str) -> list[str]:
 
 
 def _filter_pending_clips(clip_dirs: list[str], output_dir: str, verify_video: bool = False) -> list[str]:
-    """Return only clips whose output video does not yet exist or failed verification.
+    """Return clips that still need rendering.
 
-    When verify_video is True, existing videos are checked for integrity (file can be
-    opened and frame 0 read). Truncated/corrupt files will be re-rendered.
+    Logic: for each clip in clip_dirs, if output video exists:
+    - verify_video=False: treat as done, skip
+    - verify_video=True: verify file integrity; if ok skip, else delete corrupt file and re-render
     """
     if not output_dir:
         return clip_dirs
-    video_dir = os.path.join(output_dir, "video")
-    video_dir_abs = os.path.abspath(video_dir)
-    print(f"[IsaacSim] Output video dir: {video_dir_abs}", flush=True)
+    video_dir = os.path.abspath(os.path.join(output_dir, "video"))
+    print(f"[IsaacSim] Output video dir: {video_dir}", flush=True)
 
-    pending = []
-    to_verify: list[tuple[str, str]] = []
-    for data_dir in clip_dirs:
+    def _get_clip_id(data_dir: str) -> str:
         try:
             with open(os.path.join(data_dir, "meta.json")) as f:
-                meta = json.load(f)
-            clip_id = meta.get("clip_id", os.path.basename(data_dir.rstrip("/")))
+                return json.load(f).get("clip_id", os.path.basename(data_dir.rstrip("/")))
         except Exception:
-            clip_id = os.path.basename(data_dir.rstrip("/"))
+            return os.path.basename(data_dir.rstrip("/"))
+
+    pending = []
+    to_verify: list[tuple[str, str]] = []  # (data_dir, out_path)
+
+    for data_dir in clip_dirs:
+        clip_id = _get_clip_id(data_dir)
         out_path = os.path.join(video_dir, f"{clip_id}.mp4")
         if not os.path.isfile(out_path):
             pending.append(data_dir)
         elif verify_video:
             to_verify.append((data_dir, out_path))
+        # else: file exists, no verify -> skip
 
     if not to_verify:
-        if pending:
-            print(f"[IsaacSim] No existing videos to verify, {len(pending)} to render", flush=True)
+        print(f"[IsaacSim] {len(pending)} to render", flush=True)
         return pending
 
-    print(f"[IsaacSim] Verifying {len(to_verify)} videos in {video_dir_abs}", flush=True)
-    if to_verify:
-        _sample_out = os.path.abspath(to_verify[0][1])
-        print(f"[IsaacSim] Example path: {_sample_out}", flush=True)
+    print(f"[IsaacSim] Verifying {len(to_verify)} videos in {video_dir}", flush=True)
     try:
         from tqdm import tqdm
-        iter_verify = tqdm(to_verify, desc="Verify videos", unit="clip", file=sys.stdout)
+        it = tqdm(to_verify, desc="Verify videos", unit="clip", file=sys.stdout)
     except ImportError:
         n_total = len(to_verify)
-        def _iter_with_progress():
-            for i, item in enumerate(to_verify):
-                print(f"\r[IsaacSim] Verify videos: {i + 1}/{n_total}", end="", flush=True)
-                yield item
+        def it():
+            for i, x in enumerate(to_verify):
+                print(f"\r[IsaacSim] Verify: {i + 1}/{n_total}", end="", flush=True)
+                yield x
             print(flush=True)
-        iter_verify = _iter_with_progress()
+        it = it()
 
-    n_failed = 0
-    for data_dir, out_path in iter_verify:
+    for data_dir, out_path in it:
         try:
             import imageio
             r = imageio.get_reader(out_path)
@@ -691,10 +690,13 @@ def _filter_pending_clips(clip_dirs: list[str], output_dir: str, verify_video: b
             finally:
                 r.close()
         except Exception:
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
             pending.append(data_dir)
-            n_failed += 1
 
-    print(f"[IsaacSim] Verify done: {len(to_verify) - n_failed} ok (skip), {n_failed} invalid, {len(pending)} total pending", flush=True)
+    print(f"[IsaacSim] Verify done: {len(to_verify) - len([d for d, _ in to_verify if d in pending])} ok, {len(pending)} to render", flush=True)
     return pending
 
 
