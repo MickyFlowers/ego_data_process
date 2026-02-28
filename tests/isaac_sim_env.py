@@ -10,6 +10,7 @@ Videos saved to output_dir/video/ (or output_dir/part{i}/video/ when using --cli
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import multiprocessing
 import os
@@ -64,6 +65,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--render-height", type=int, default=512)
     parser.add_argument("--render-size", type=int, default=512, help="Square resolution for render (default: 512x512)")
     parser.add_argument("--render-scale", type=float, default=1.0, help="Scale resolution for speed (e.g. 0.5 = half res)")
+    parser.add_argument(
+        "--verify-video",
+        action="store_true",
+        help="When skipping already-generated videos, verify each file is complete (can be opened and read). Truncated/corrupt files will be re-rendered.",
+    )
     return parser
 
 
@@ -225,6 +231,8 @@ class IsaacSimEnv:
         self._render_product = None
         self._rgb_annotator = None
         self._seg_annotator = None
+        self._intrinsics_cam = None
+        self._intrinsics_cam_resolution = None
         self._setup_replicator_render(args)
 
     # ------------------------------------------------------------------
@@ -295,8 +303,8 @@ class IsaacSimEnv:
             xform.AddTransformOp().Set(rot_mat)
 
     # ------------------------------------------------------------------
-    @staticmethod
     def _set_camera_intrinsics_opencv(
+        self,
         cam_path: str,
         K: np.ndarray,
         width: int,
@@ -305,39 +313,36 @@ class IsaacSimEnv:
         far: float,
         *,
         render_product_path: str | None = None,
-        pixel_size_um: float = 3.0,
     ) -> None:
         """Set camera intrinsics via OpenCV pinhole model.
 
-        Focal length and aperture derived from K: horizontal_aperture = pixel_size*width,
-        focal_length = pixel_size*(fx+fy)/2, all in meters (stage units).
+        Caches Camera instance per (width, height) to avoid repeated initialize() which
+        accumulates render callbacks and degrades frame rate over time.
         """
         from isaacsim.sensors.camera import Camera
 
         (fx, _, cx), (_, fy, cy), (_, _, _) = K[0:3, 0:3]
         fx, fy, cx, cy = float(fx), float(fy), float(cx), float(cy)
 
-        # pixel_size = pixel_size_um * 1e-6
-        # horizontal_aperture = pixel_size * width
-        # vertical_aperture = pixel_size * height
-        # fx, fy 可不同（非正方形像素），set_focal_length 僅接受單值，用 fx 與 horizontal_aperture 對應
-        # 實際投影由 set_opencv_pinhole_properties 的 fx, fy 分別控制
-        # focal_length = pixel_size * fy
+        res_key = (width, height)
+        if self._intrinsics_cam is None or self._intrinsics_cam_resolution != res_key:
+            if self._intrinsics_cam is not None:
+                try:
+                    self._intrinsics_cam.destroy()
+                except Exception:
+                    pass
+            cam = Camera(
+                prim_path=cam_path,
+                resolution=(width, height),
+                frequency=None,
+                render_product_path=render_product_path,
+            )
+            cam.initialize(attach_rgb_annotator=False)
+            self._intrinsics_cam = cam
+            self._intrinsics_cam_resolution = res_key
 
-        cam = Camera(
-            prim_path=cam_path,
-            resolution=(width, height),
-            frequency=None,
-            render_product_path=render_product_path,
-        )
-        cam.initialize(attach_rgb_annotator=False)
-
-        # cam.set_focal_length(focal_length)
-        # cam.set_lens_aperture(0.0)
-        # cam.set_horizontal_aperture(horizontal_aperture, maintain_square_pixels=False)
-        # cam.set_vertical_aperture(vertical_aperture, maintain_square_pixels=False)
-        cam.set_clipping_range(float(near), float(far))
-        cam.set_opencv_pinhole_properties(cx=cx, cy=cy, fx=fx, fy=fy, pinhole=[0.0] * 12)
+        self._intrinsics_cam.set_clipping_range(float(near), float(far))
+        self._intrinsics_cam.set_opencv_pinhole_properties(cx=cx, cy=cy, fx=fx, fy=fy, pinhole=[0.0] * 12)
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -628,6 +633,40 @@ def _gather_clip_dirs(input_dir: str) -> list[str]:
     return [os.path.abspath(os.path.join(root, n)) for n in names if os.path.isdir(os.path.join(root, n))]
 
 
+def _filter_pending_clips(clip_dirs: list[str], output_dir: str, verify_video: bool = False) -> list[str]:
+    """Return only clips whose output video does not yet exist or failed verification.
+
+    When verify_video is True, existing videos are checked for integrity (file can be
+    opened and frame 0 read). Truncated/corrupt files will be re-rendered.
+    """
+    if not output_dir:
+        return clip_dirs
+    video_dir = os.path.join(output_dir, "video")
+    pending = []
+    for data_dir in clip_dirs:
+        try:
+            with open(os.path.join(data_dir, "meta.json")) as f:
+                meta = json.load(f)
+            clip_id = meta.get("clip_id", os.path.basename(data_dir.rstrip("/")))
+        except Exception:
+            clip_id = os.path.basename(data_dir.rstrip("/"))
+        out_path = os.path.join(video_dir, f"{clip_id}.mp4")
+        if not os.path.isfile(out_path):
+            pending.append(data_dir)
+            continue
+        if verify_video:
+            try:
+                import imageio
+                r = imageio.get_reader(out_path)
+                try:
+                    r.get_data(0)
+                finally:
+                    r.close()
+            except Exception:
+                pending.append(data_dir)
+    return pending
+
+
 def _render_single_clip(env: IsaacSimEnv, data_dir: str, opts: argparse.Namespace | dict) -> dict | None:
     """Render one clip; returns stats dict or None on failure."""
     import json
@@ -690,7 +729,7 @@ def _render_single_clip(env: IsaacSimEnv, data_dir: str, opts: argparse.Namespac
     rp_path = None
     if env._render_product is not None:
         rp_path = getattr(env._render_product, "path", env._render_product)
-    IsaacSimEnv._set_camera_intrinsics_opencv(
+    env._set_camera_intrinsics_opencv(
         "/OmniverseKit_Persp",
         K_scaled,
         width=render_w,
@@ -737,7 +776,8 @@ def _render_single_clip(env: IsaacSimEnv, data_dir: str, opts: argparse.Namespac
         try:
             import imageio
 
-            writer = imageio.get_writer(output_video_path, fps=fps_meta, codec="libx264", macro_block_size=1)
+            tmp_path = output_video_path + ".tmp"
+            writer = imageio.get_writer(tmp_path, fps=fps_meta, codec="libx264", macro_block_size=1)
         except ImportError:
             writer = None
 
@@ -828,6 +868,9 @@ def _render_single_clip(env: IsaacSimEnv, data_dir: str, opts: argparse.Namespac
 
     if writer is not None:
         writer.close()
+        tmp_path = output_video_path + ".tmp"
+        if os.path.isfile(tmp_path):
+            os.rename(tmp_path, output_video_path)
         render_fps = n_frames / t_elapsed if t_elapsed > 0 else 0.0
         return {
             "clip_id": clip_id,
@@ -854,6 +897,7 @@ def _queue_worker(
     os.environ["TMPDIR"] = worker_tmp
     os.environ["TEMP"] = worker_tmp
     os.environ["TMP"] = worker_tmp
+    os.chdir(worker_tmp)  # URDF importer writes base_link.tmp.usd to CWD; isolate per worker
 
     parser = build_parser()
     args = parser.parse_args([])
@@ -880,6 +924,8 @@ def _queue_worker(
         except Exception as e:
             result_queue.put({"clip_id": clip_name, "error": str(e)})
             print(f"  Error: {e}", flush=True)
+        if done_count % 20 == 0:
+            gc.collect()
     env.close()
 
 
@@ -907,14 +953,20 @@ def _run_multiprocessing_batch(args: argparse.Namespace, clip_dirs: list[str]) -
         "no_dae_materials": getattr(args, "no_dae_materials", False),
     }
 
+    pending_dirs = _filter_pending_clips(
+        clip_dirs, args.output_dir, verify_video=getattr(args, "verify_video", False)
+    )
+    n_skipped = len(clip_dirs) - len(pending_dirs)
+
     task_queue = multiprocessing.Queue()
     result_queue = multiprocessing.Queue()
-    for data_dir in clip_dirs:
+    for data_dir in pending_dirs:
         task_queue.put(data_dir)
     for _ in range(num_workers):
         task_queue.put(None)  # sentinel per worker
 
-    print(f"[IsaacSim] Queue mode: {len(clip_dirs)} clips, {num_workers} workers", flush=True)
+    verify_msg = " (with --verify-video)" if getattr(args, "verify_video", False) else ""
+    print(f"[IsaacSim] Queue mode: {len(pending_dirs)} clips" + (f" ({n_skipped} already done, skipped{verify_msg})" if n_skipped else "") + f", {num_workers} workers", flush=True)
     t_start = time.time()
     workers = []
     for w in range(num_workers):
@@ -927,13 +979,13 @@ def _run_multiprocessing_batch(args: argparse.Namespace, clip_dirs: list[str]) -
 
     all_results = []
     result_timeout = 300
-    while len(all_results) < len(clip_dirs):
+    while len(all_results) < len(pending_dirs):
         try:
             r = result_queue.get(timeout=result_timeout)
             all_results.append(r)
         except queue.Empty:
             if not any(p.is_alive() for p in workers):
-                print(f"[IsaacSim] Warning: all workers ended, only {len(all_results)}/{len(clip_dirs)} results", flush=True)
+                print(f"[IsaacSim] Warning: all workers ended, only {len(all_results)}/{len(pending_dirs)} results", flush=True)
                 break
     for p in workers:
         p.join(timeout=10)
@@ -942,7 +994,8 @@ def _run_multiprocessing_batch(args: argparse.Namespace, clip_dirs: list[str]) -
     parallel_fps = total_frames / t_elapsed if t_elapsed > 0 else 0.0
 
     summary = {
-        "total": len(clip_dirs),
+        "total": len(pending_dirs),
+        "skipped": n_skipped,
         "success": sum(1 for r in all_results if "error" not in r),
         "failed": sum(1 for r in all_results if "error" in r),
         "total_frames": total_frames,
@@ -1067,6 +1120,11 @@ if __name__ == "__main__":
         _run_multiprocessing_batch(args, clip_dirs)
     else:
         # Single-process: one env, process clips sequentially
+        pending_dirs = (
+            _filter_pending_clips(clip_dirs, output_dir, verify_video=getattr(args, "verify_video", False))
+            if output_dir
+            else clip_dirs
+        )
         env = IsaacSimEnv(args)
         do_render = output_dir and env._render_product is not None
         if do_render:
@@ -1075,9 +1133,9 @@ if __name__ == "__main__":
 
         t_start = time.time()
         all_stats = []
-        for i, clip_dir in enumerate(clip_dirs):
+        for i, clip_dir in enumerate(pending_dirs):
             clip_name = os.path.basename(clip_dir.rstrip("/"))
-            print(f"[IsaacSimEnv] [{i+1}/{len(clip_dirs)}] {clip_name}", flush=True)
+            print(f"[IsaacSimEnv] [{i+1}/{len(pending_dirs)}] {clip_name}", flush=True)
             stats = _render_single_clip(env, clip_dir, args)
             if stats is not None:
                 all_stats.append(stats)
@@ -1085,12 +1143,14 @@ if __name__ == "__main__":
                     print(f"  Saved, FPS: {stats['render_fps']:.1f}", flush=True)
             else:
                 all_stats.append({"clip_id": clip_name, "error": "render failed"})
+            if (i + 1) % 20 == 0:
+                gc.collect()
         t_elapsed = time.time() - t_start
 
         if do_render and output_dir:
             total_frames = sum(r.get("n_frames", 0) for r in all_stats if "error" not in r)
             summary = {
-                "total": len(clip_dirs),
+                "total": len(pending_dirs),
                 "success": sum(1 for r in all_stats if "error" not in r),
                 "failed": sum(1 for r in all_stats if "error" in r),
                 "total_frames": total_frames,

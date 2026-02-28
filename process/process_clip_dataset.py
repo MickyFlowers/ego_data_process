@@ -25,6 +25,7 @@ def main(args):
     with open(Path(output_dir) / "clip_parts.json", "w") as f:
         json.dump(clip_parts_str, f, indent=4)
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-dir", type=str, required=True)
