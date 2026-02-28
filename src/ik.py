@@ -279,23 +279,39 @@ def load_pose_data_from_json(
 # -----------------------------------------------------------------------------
 # Robot loading and parsing
 # -----------------------------------------------------------------------------
-def load_robot(urdf_path: str, use_gui: bool = True) -> int:
-    """Load URDF, connect GUI/DIRECT, return robot_id. Tries EGL plugin for GPU rendering in DIRECT mode."""
+def load_robot(urdf_path: str, use_gui: bool = True, use_egl: bool = False) -> int:
+    """Load URDF, connect GUI/DIRECT, return robot_id.
+
+    Args:
+        use_egl: Load the EGL GPU renderer plugin in DIRECT mode.  Only needed
+                 for ``p.getCameraImage`` calls; IK solving does not use it.
+                 Each EGL instance allocates GPU VRAM, so avoid loading it in
+                 workers that never render.
+    """
     if use_gui:
         p.connect(p.GUI)
     else:
-        cid = p.connect(p.DIRECT)
-        # Try loading EGL plugin for GPU rendering (faster than TinyRenderer)
-        try:
-            import pkgutil
-            egl = pkgutil.get_loader("eglRenderer")
-            if egl:
-                p.loadPlugin(egl.get_filename(), "_eglRendererPlugin")
-        except Exception:
-            pass
+        p.connect(p.DIRECT)
+        if use_egl:
+            try_load_egl()
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
     robot_id = p.loadURDF(urdf_path, useFixedBase=True)
     return robot_id
+
+
+def try_load_egl() -> bool:
+    """Try to load the EGL GPU renderer plugin on the current physics client.
+    Safe to call multiple times (pybullet ignores duplicate loads).
+    Returns True if the plugin was loaded successfully."""
+    try:
+        import pkgutil
+        egl = pkgutil.get_loader("eglRenderer")
+        if egl:
+            p.loadPlugin(egl.get_filename(), "_eglRendererPlugin")
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def parse_arm_info(robot_id: int) -> dict[str, Any]:
@@ -1142,6 +1158,9 @@ def process_single_clip(
     urdf_path: str = "",
     verbose: bool = True,
     camera_elevation_deg: float = 45.0,
+    robot_id: int | None = None,
+    robot_info: dict[str, Any] | None = None,
+    auto_disconnect: bool = True,
 ) -> dict:
     """
     Process single clip: IK solve -> Joint KF -> error stats -> save.
@@ -1177,10 +1196,11 @@ def process_single_clip(
     left_gripper = left_gripper[:n_frames]
     right_gripper = right_gripper[:n_frames]
 
-    # --- PyBullet init ---
-    robot_id = load_robot(urdf_path, use_gui=use_gui)
-    apply_robot_visual_settings(robot_id)
-    robot_info = parse_arm_info(robot_id)
+    # --- PyBullet init (skip when caller supplies a pre-loaded env) ---
+    if robot_id is None or robot_info is None:
+        robot_id = load_robot(urdf_path, use_gui=use_gui, use_egl=do_render)
+        apply_robot_visual_settings(robot_id)
+        robot_info = parse_arm_info(robot_id)
 
     # --- IK ---
     t0 = time.time()
@@ -1281,8 +1301,9 @@ def process_single_clip(
         else:
             print(f"[{clip_id}] Render skipped: source video not found ({video_path})")
 
-    # --- Disconnect PyBullet ---
-    p.disconnect()
+    # --- Disconnect PyBullet (skip when env is managed externally) ---
+    if auto_disconnect:
+        p.disconnect()
 
     if verbose:
         print(f"[{clip_id}] Done: {n_frames} frames, IK {ik_time:.1f}s, collisions {collision_count}")

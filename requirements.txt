@@ -7,5 +7,6 @@ imageio-ffmpeg
 torch
 torchvision
 scipy
-chumpy --no-build-isolation
+chumpy
 matplotlib
+ray
