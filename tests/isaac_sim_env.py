@@ -1,25 +1,22 @@
 """Isaac Sim environment for loading and visualizing the Aloha URDF robot.
 
-Batch mode: Ray multi-process, one GPU per worker, each worker initializes
-SimulationApp once and processes all assigned clips sequentially.
+Multiprocessing mode: N workers, each initializes SimulationApp once and processes
+assigned clips sequentially. Videos saved to output_dir/video/.
 
-    python tests/isaac_sim_env.py --input-dir outputs/ik/data --output-dir outputs/render --headless
+    python tests/isaac_sim_env.py --input-dir outputs/ik/data --output-dir outputs/render --headless --num-workers 2
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
 import os
 import sys
 import time
 import xml.etree.ElementTree as ET
 
 import numpy as np
-import ray
-
-# SimulationApp imported lazily in IsaacSimEnv / IsaacSimWorkerActor to avoid
-# loading Omniverse in the Ray main process when using batch mode
 
 
 def _parse_vec3(s: str) -> np.ndarray:
@@ -31,7 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--urdf-path",
         type=str,
-        default="/home/cyx/projects/mobile_aloha_sim/aloha_new_description/urdf/dual_piper.urdf",
+        default="./assets/aloha_new_description/urdf/dual_piper.urdf",
     )
     parser.add_argument("--fix-base", action="store_true", default=True)
     parser.add_argument("--merge-fixed-joints", action="store_true", default=False)
@@ -724,7 +721,8 @@ def _render_single_clip(env: IsaacSimEnv, data_dir: str, opts: argparse.Namespac
     writer = None
     fps_meta = meta.get("fps", 30)
     clip_id = meta.get("clip_id", os.path.basename(data_dir.rstrip("/")))
-    output_video_path = os.path.join(output_dir, f"{clip_id}.mp4") if output_dir else None
+    video_dir = os.path.join(output_dir, "video") if output_dir else None
+    output_video_path = os.path.join(video_dir, f"{clip_id}.mp4") if video_dir else None
 
     render_w = _get("render_width", 512)
     render_h = _get("render_height", 512)
@@ -735,6 +733,7 @@ def _render_single_clip(env: IsaacSimEnv, data_dir: str, opts: argparse.Namespac
 
     if do_render:
         os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(video_dir, exist_ok=True)
         video_path = _get("video_path") or meta.get("video_path")
         if not _get("no_overlay", False) and video_path and os.path.isfile(video_path):
             try:
@@ -842,169 +841,104 @@ def _render_single_clip(env: IsaacSimEnv, data_dir: str, opts: argparse.Namespac
     return None
 
 
-# ----------------------------------------------------------------------
-@ray.remote(max_restarts=3, max_task_retries=0)
-class IsaacSimWorkerActor:
-    """One Isaac Sim app per process; init once, process multiple clips."""
+def _worker_process_clips(task: tuple) -> list[dict]:
+    """Worker: init SimulationApp once, process assigned clips. Run in separate process."""
+    worker_id, clip_dirs, opts_dict = task
+    tag = f"[IsaacSim Worker{worker_id}]"
 
-    def __init__(
-        self,
-        urdf_path: str,
-        headless: bool,
-        render_size: int,
-        render_scale: float,
-        no_overlay: bool,
-        video_path: str | None = None,
-    ):
-        self._app = None
-        self._env = None
-        self._urdf_path = urdf_path
-        self._headless = headless
-        self._render_size = render_size
-        self._render_scale = render_scale
-        self._no_overlay = no_overlay
-        self._video_path = video_path
-        self._init_app()
+    # Serial startup: stagger Isaac Sim init to avoid URDF temp file conflicts
+    startup_delay = opts_dict.get("startup_delay", 0)
+    if startup_delay > 0 and worker_id > 0:
+        delay_sec = worker_id * startup_delay
+        print(f"{tag} waiting {delay_sec}s before startup (serial init)", flush=True)
+        time.sleep(delay_sec)
 
-    def _init_app(self) -> None:
-        from isaacsim import SimulationApp
+    parser = build_parser()
+    args = parser.parse_args([])
+    for key, val in opts_dict.items():
+        if hasattr(args, key):
+            setattr(args, key, val)
 
-        app_config = {
-            "headless": self._headless,
-            "width": 1280,
-            "height": 720,
-        }
-        if self._headless:
-            app_config["windowless"] = True
-        self._app = SimulationApp(app_config)
-
-        parser = build_parser()
-        args = parser.parse_args([])
-        args.urdf_path = self._urdf_path
-        args.headless = self._headless
-        args.render_size = self._render_size
-        args.render_scale = self._render_scale
-        args.render_width = args.render_height = self._render_size
-        args.no_overlay = self._no_overlay
-        self._env = IsaacSimEnv(args)
-
-    def process_clips(
-        self,
-        clip_dirs: list[str],
-        output_dir: str,
-        worker_id: int,
-    ) -> list[dict]:
-        opts = {
-            "output_dir": output_dir,
-            "render_width": self._render_size,
-            "render_height": self._render_size,
-            "render_scale": self._render_scale,
-            "no_overlay": self._no_overlay,
-            "video_path": self._video_path,
-        }
-        results = []
-        tag = f"[IsaacSim GPU{worker_id}]"
-        for i, data_dir in enumerate(clip_dirs):
-            clip_name = os.path.basename(data_dir.rstrip("/"))
-            print(f"{tag} [{i+1}/{len(clip_dirs)}] {clip_name}", flush=True)
-            try:
-                stats = _render_single_clip(self._env, data_dir, opts)
-                if stats is not None:
-                    results.append(stats)
-                    print(f"  Saved, FPS: {stats['render_fps']:.1f}", flush=True)
-                else:
-                    results.append({"clip_id": clip_name, "error": "render failed"})
-            except Exception as e:
-                results.append({"clip_id": clip_name, "error": str(e)})
-                print(f"  Error: {e}", flush=True)
-        return results
-
-    def shutdown(self) -> None:
-        if self._env is not None:
-            try:
-                self._env.close()
-            except Exception:
-                pass
-        self._env = None
-        self._app = None
+    env = IsaacSimEnv(args)
+    results = []
+    for i, data_dir in enumerate(clip_dirs):
+        clip_name = os.path.basename(data_dir.rstrip("/"))
+        print(f"{tag} [{i+1}/{len(clip_dirs)}] {clip_name}", flush=True)
+        try:
+            stats = _render_single_clip(env, data_dir, opts_dict)
+            if stats is not None:
+                results.append(stats)
+                print(f"  Saved, FPS: {stats['render_fps']:.1f}", flush=True)
+            else:
+                results.append({"clip_id": clip_name, "error": "render failed"})
+        except Exception as e:
+            results.append({"clip_id": clip_name, "error": str(e)})
+            print(f"  Error: {e}", flush=True)
+    env.close()
+    return results
 
 
-def _run_ray_batch(args: argparse.Namespace, clip_dirs: list[str]) -> None:
-    """Ray multi-GPU batch: one process per GPU, each init app once."""
-    ray_kwargs = {}
-    if getattr(args, "num_gpus", None) is not None:
-        ray_kwargs["num_gpus"] = args.num_gpus
-    ray.init(**ray_kwargs)
+def _run_multiprocessing_batch(args: argparse.Namespace, clip_dirs: list[str]) -> None:
+    """Multiprocessing batch: distribute clips across workers."""
+    num_workers = max(1, getattr(args, "num_workers", 1))
+    if num_workers <= 1 or len(clip_dirs) <= 1:
+        num_workers = 1
 
-    cluster = ray.cluster_resources()
-    total_gpus = cluster.get("GPU", 0)
-    num_workers = max(1, int(total_gpus)) if total_gpus > 0 else 1
-    gpus_per_worker = total_gpus / num_workers if total_gpus > 0 else 0
+    opts_dict = {
+        "output_dir": args.output_dir,
+        "render_width": getattr(args, "render_width", 512),
+        "render_height": getattr(args, "render_height", 512),
+        "render_scale": getattr(args, "render_scale", 1.0),
+        "render_size": getattr(args, "render_size", 512),
+        "no_overlay": args.no_overlay,
+        "video_path": getattr(args, "video_path", None),
+        "urdf_path": args.urdf_path,
+        "headless": args.headless,
+        "merge_fixed_joints": args.merge_fixed_joints,
+        "fix_base": args.fix_base,
+        "dt": args.dt,
+        "width": args.width,
+        "height": args.height,
+        "no_dae_materials": getattr(args, "no_dae_materials", False),
+        "startup_delay": getattr(args, "startup_delay", 0),
+    }
 
     worker_clips: list[list[str]] = [[] for _ in range(num_workers)]
     for i, cd in enumerate(clip_dirs):
         worker_clips[i % num_workers].append(cd)
-    active: list[tuple[int, list[str]]] = [
-        (w, clips) for w, clips in enumerate(worker_clips) if clips
-    ]
+    tasks = [(w, clips, opts_dict) for w, clips in enumerate(worker_clips) if clips]
 
-    print(f"[IsaacSim] Ray batch: {len(clip_dirs)} clips, {len(active)} workers "
-          f"({total_gpus} GPUs)")
-    for w, clips in active:
-        print(f"  Worker {w}: {len(clips)} clips")
+    startup_delay = getattr(args, "startup_delay", 0)
+    print(f"[IsaacSim] Multiprocessing: {len(clip_dirs)} clips, {len(tasks)} workers", flush=True)
+    if startup_delay > 0:
+        print(f"  Serial startup: {startup_delay}s delay between workers", flush=True)
+    for w, clips, _ in tasks:
+        print(f"  Worker {w}: {len(clips)} clips", flush=True)
 
-    actor_options = {"num_cpus": 1.0}
-    if gpus_per_worker > 0:
-        actor_options["num_gpus"] = gpus_per_worker
+    t_start = time.time()
+    with multiprocessing.Pool(processes=len(tasks)) as pool:
+        worker_results = pool.map(_worker_process_clips, tasks)
+    t_elapsed = time.time() - t_start
 
-    futures = []
-    for w, clips in active:
-        actor = IsaacSimWorkerActor.options(**actor_options).remote(
-            urdf_path=args.urdf_path,
-            headless=args.headless,
-            render_size=getattr(args, "render_size", 512),
-            render_scale=getattr(args, "render_scale", 1.0),
-            no_overlay=args.no_overlay,
-            video_path=getattr(args, "video_path", None),
-        )
-        fut = actor.process_clips.remote(clips, args.output_dir, w)
-        futures.append((fut, w, actor))
-
-    t_batch_start = time.time()
-    all_results = []
-    for fut, w, actor in futures:
-        try:
-            worker_results = ray.get(fut)
-            all_results.extend(worker_results)
-            n_ok = sum(1 for r in worker_results if "error" not in r)
-            print(f"[IsaacSim] Worker {w}: {n_ok}/{len(worker_results)} ok")
-        except Exception as e:
-            print(f"[IsaacSim] Worker {w} failed: {e}")
-        try:
-            ray.get(actor.shutdown.remote(), timeout=5)
-        except Exception:
-            pass
-
-    t_batch_elapsed = time.time() - t_batch_start
+    all_results = [r for results in worker_results for r in results]
     total_frames = sum(r.get("n_frames", 0) for r in all_results if "error" not in r)
-    parallel_fps = total_frames / t_batch_elapsed if t_batch_elapsed > 0 else 0.0
+    parallel_fps = total_frames / t_elapsed if t_elapsed > 0 else 0.0
 
     summary = {
         "total": len(clip_dirs),
         "success": sum(1 for r in all_results if "error" not in r),
         "failed": sum(1 for r in all_results if "error" in r),
         "total_frames": total_frames,
-        "wall_clock_seconds": round(t_batch_elapsed, 2),
+        "wall_clock_seconds": round(t_elapsed, 2),
         "parallel_fps": round(parallel_fps, 2),
         "clips": all_results,
     }
-    summary_path = os.path.join(args.output_dir, "render_stats.json")
     os.makedirs(args.output_dir, exist_ok=True)
+    summary_path = os.path.join(args.output_dir, "render_stats.json")
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"[IsaacSim] Done: {summary['success']}/{summary['total']} ok, "
-          f"{total_frames} frames in {t_batch_elapsed:.1f}s -> {parallel_fps:.1f} parallel FPS -> {summary_path}")
-    ray.shutdown()
+          f"{total_frames} frames in {t_elapsed:.1f}s -> {parallel_fps:.1f} parallel FPS -> {summary_path}", flush=True)
 
 
 # ----------------------------------------------------------------------
@@ -1025,10 +959,16 @@ if __name__ == "__main__":
         help="IK output dir (outputs/ik) or data dir (outputs/ik/data). Process all clips within.",
     )
     parser.add_argument(
-        "--num-gpus",
+        "--num-workers",
         type=int,
-        default=None,
-        help="Total GPUs for Ray (default: all). One worker per GPU.",
+        default=1,
+        help="Number of parallel workers (multiprocessing). Default 1 = single process.",
+    )
+    parser.add_argument(
+        "--startup-delay",
+        type=float,
+        default=15.0,
+        help="Seconds to wait between worker startups (serial init, avoids URDF temp file conflicts). Default 45.",
     )
     args = parser.parse_args()
 
@@ -1057,41 +997,70 @@ if __name__ == "__main__":
     if not clip_dirs:
         raise FileNotFoundError("No valid clip directories")
 
-    # Ray batch: input-dir + output-dir -> one process per GPU
-    use_ray = args.input_dir and args.output_dir and len(clip_dirs) > 0
-    if use_ray:
-        _run_ray_batch(args, clip_dirs)
+    # Resolve render size from first clip
+    data_dir = clip_dirs[0]
+    with open(os.path.join(data_dir, "meta.json")) as f:
+        meta = json.load(f)
+    img_size = meta.get("img_size", [512, 512])
+    render_size = getattr(args, "render_size", None)
+    if render_size is not None and render_size > 0:
+        args.render_width = args.render_height = render_size
+    else:
+        args.render_width = img_size[0]
+        args.render_height = img_size[1]
+
+    output_dir = getattr(args, "output_dir", None)
+    num_workers = max(1, getattr(args, "num_workers", 1))
+    use_multiprocessing = (
+        output_dir
+        and num_workers > 1
+        and len(clip_dirs) > 1
+    )
+
+    if use_multiprocessing:
+        # Multiprocessing: spawn workers (no CUDA_VISIBLE_DEVICES)
+        try:
+            multiprocessing.set_start_method("spawn")
+        except RuntimeError:
+            pass  # already set
+        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(os.path.join(output_dir, "video"), exist_ok=True)
+        _run_multiprocessing_batch(args, clip_dirs)
     else:
         # Single-process: one env, process clips sequentially
-        data_dir = clip_dirs[0]
-        with open(os.path.join(data_dir, "meta.json")) as f:
-            meta = json.load(f)
-        img_size = meta.get("img_size", [512, 512])
-        render_size = getattr(args, "render_size", None)
-        if render_size is not None and render_size > 0:
-            args.render_width = args.render_height = render_size
-        else:
-            args.render_width = img_size[0]
-            args.render_height = img_size[1]
-
         env = IsaacSimEnv(args)
-        output_dir = getattr(args, "output_dir", None)
         do_render = output_dir and env._render_product is not None
         if do_render:
             os.makedirs(output_dir, exist_ok=True)
+            os.makedirs(os.path.join(output_dir, "video"), exist_ok=True)
 
+        t_start = time.time()
         all_stats = []
         for i, clip_dir in enumerate(clip_dirs):
             clip_name = os.path.basename(clip_dir.rstrip("/"))
-            print(f"[IsaacSimEnv] [{i+1}/{len(clip_dirs)}] {clip_name}")
+            print(f"[IsaacSimEnv] [{i+1}/{len(clip_dirs)}] {clip_name}", flush=True)
             stats = _render_single_clip(env, clip_dir, args)
             if stats is not None:
                 all_stats.append(stats)
                 if do_render:
-                    print(f"  Saved, FPS: {stats['render_fps']:.1f}")
+                    print(f"  Saved, FPS: {stats['render_fps']:.1f}", flush=True)
+            else:
+                all_stats.append({"clip_id": clip_name, "error": "render failed"})
+        t_elapsed = time.time() - t_start
 
-        if do_render and output_dir and all_stats:
-            summary = {"clips": all_stats, "total_clips": len(all_stats), "failed": len(clip_dirs) - len(all_stats)}
-            with open(os.path.join(output_dir, "render_stats.json"), "w") as f:
+        if do_render and output_dir:
+            total_frames = sum(r.get("n_frames", 0) for r in all_stats if "error" not in r)
+            summary = {
+                "total": len(clip_dirs),
+                "success": sum(1 for r in all_stats if "error" not in r),
+                "failed": sum(1 for r in all_stats if "error" in r),
+                "total_frames": total_frames,
+                "wall_clock_seconds": round(t_elapsed, 2),
+                "clips": all_stats,
+            }
+            summary_path = os.path.join(output_dir, "render_stats.json")
+            with open(summary_path, "w") as f:
                 json.dump(summary, f, indent=2)
+            print(f"[IsaacSim] Done: {summary['success']}/{summary['total']} ok, "
+                  f"{total_frames} frames in {t_elapsed:.1f}s -> {summary_path}", flush=True)
         env.close()

@@ -4,9 +4,8 @@ opencv-python-headless
 scipy
 imageio
 imageio-ffmpeg
-torch
-torchvision
+# torch
+# torchvision
 scipy
 matplotlib
-ray
 h5py
