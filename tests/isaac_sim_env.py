@@ -805,7 +805,7 @@ def _render_single_clip(env: IsaacSimEnv, data_dir: str, opts: argparse.Namespac
         try:
             import imageio
 
-            tmp_path = output_video_path + ".tmp"
+            tmp_path = output_video_path.replace(".mp4", ".tmp.mp4")
             writer = imageio.get_writer(tmp_path, fps=fps_meta, codec="libx264", macro_block_size=1)
         except ImportError:
             writer = None
@@ -897,7 +897,7 @@ def _render_single_clip(env: IsaacSimEnv, data_dir: str, opts: argparse.Namespac
 
     if writer is not None:
         writer.close()
-        tmp_path = output_video_path + ".tmp"
+        tmp_path = output_video_path.replace(".mp4", ".tmp.mp4")
         if os.path.isfile(tmp_path):
             os.rename(tmp_path, output_video_path)
         render_fps = n_frames / t_elapsed if t_elapsed > 0 else 0.0
