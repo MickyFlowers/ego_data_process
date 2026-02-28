@@ -968,8 +968,11 @@ def _run_multiprocessing_batch(args: argparse.Namespace, clip_dirs: list[str]) -
     urdf_path = args.urdf_path
     if not os.path.isabs(urdf_path):
         urdf_path = os.path.abspath(urdf_path)
+    output_dir = args.output_dir
+    if output_dir and not os.path.isabs(output_dir):
+        output_dir = os.path.abspath(output_dir)
     opts_dict = {
-        "output_dir": args.output_dir,
+        "output_dir": output_dir,
         "render_width": getattr(args, "render_width", 512),
         "render_height": getattr(args, "render_height", 512),
         "render_scale": getattr(args, "render_scale", 1.0),
