@@ -965,6 +965,9 @@ def _run_multiprocessing_batch(args: argparse.Namespace, clip_dirs: list[str]) -
     if num_workers <= 1 or len(clip_dirs) <= 1:
         num_workers = 1
 
+    urdf_path = args.urdf_path
+    if not os.path.isabs(urdf_path):
+        urdf_path = os.path.abspath(urdf_path)
     opts_dict = {
         "output_dir": args.output_dir,
         "render_width": getattr(args, "render_width", 512),
@@ -973,7 +976,7 @@ def _run_multiprocessing_batch(args: argparse.Namespace, clip_dirs: list[str]) -
         "render_size": getattr(args, "render_size", 512),
         "no_overlay": args.no_overlay,
         "video_path": getattr(args, "video_path", None),
-        "urdf_path": args.urdf_path,
+        "urdf_path": urdf_path,
         "headless": args.headless,
         "merge_fixed_joints": args.merge_fixed_joints,
         "fix_base": args.fix_base,
