@@ -1,17 +1,25 @@
-"""Isaac Sim environment for loading and visualizing the Aloha URDF robot."""
+"""Isaac Sim environment for loading and visualizing the Aloha URDF robot.
+
+Batch mode: Ray multi-process, one GPU per worker, each worker initializes
+SimulationApp once and processes all assigned clips sequentially.
+
+    python tests/isaac_sim_env.py --input-dir outputs/ik/data --output-dir outputs/render --headless
+"""
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
 import xml.etree.ElementTree as ET
 
 import numpy as np
+import ray
 
-
-from isaacsim import SimulationApp
+# SimulationApp imported lazily in IsaacSimEnv / IsaacSimWorkerActor to avoid
+# loading Omniverse in the Ray main process when using batch mode
 
 
 def _parse_vec3(s: str) -> np.ndarray:
@@ -52,8 +60,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=str, default=None, help="Save output to this dir (enables render mode)")
     parser.add_argument("--no-overlay", action="store_true", help="Output seg only; default is overlay robot onto original video")
     parser.add_argument("--video-path", type=str, default=None, help="Override source video path for overlay (default: from meta.json)")
-    parser.add_argument("--render-width", type=int, default=896)
-    parser.add_argument("--render-height", type=int, default=504)
+    parser.add_argument("--render-width", type=int, default=512)
+    parser.add_argument("--render-height", type=int, default=512)
     parser.add_argument("--render-size", type=int, default=512, help="Square resolution for render (default: 512x512)")
     parser.add_argument("--render-scale", type=float, default=1.0, help="Scale resolution for speed (e.g. 0.5 = half res)")
     return parser
@@ -63,6 +71,8 @@ class IsaacSimEnv:
     """Manages an Isaac Sim stage with a URDF robot loaded and a third-person camera."""
 
     def __init__(self, args: argparse.Namespace | None = None):
+        from isaacsim import SimulationApp
+
         if args is None:
             args = build_parser().parse_args([])
         self.args = args
@@ -218,8 +228,8 @@ class IsaacSimEnv:
             import omni.replicator.core as rep
 
             scale = getattr(args, "render_scale", 1.0)
-            rw = int(getattr(args, "render_width", 896) * scale)
-            rh = int(getattr(args, "render_height", 504) * scale)
+            rw = int(getattr(args, "render_width", 512) * scale)
+            rh = int(getattr(args, "render_height", 512) * scale)
             rw, rh = max(64, rw), max(64, rh)
             cam_path = "/OmniverseKit_Persp"
 
@@ -277,6 +287,51 @@ class IsaacSimEnv:
             xform = UsdGeom.Xformable(cam_prim)
             xform.ClearXformOpOrder()
             xform.AddTransformOp().Set(rot_mat)
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _set_camera_intrinsics_opencv(
+        cam_path: str,
+        K: np.ndarray,
+        width: int,
+        height: int,
+        near: float,
+        far: float,
+        *,
+        render_product_path: str | None = None,
+        pixel_size_um: float = 3.0,
+    ) -> None:
+        """Set camera intrinsics via OpenCV pinhole model.
+
+        Focal length and aperture derived from K: horizontal_aperture = pixel_size*width,
+        focal_length = pixel_size*(fx+fy)/2, all in meters (stage units).
+        """
+        from isaacsim.sensors.camera import Camera
+
+        (fx, _, cx), (_, fy, cy), (_, _, _) = K[0:3, 0:3]
+        fx, fy, cx, cy = float(fx), float(fy), float(cx), float(cy)
+
+        # pixel_size = pixel_size_um * 1e-6
+        # horizontal_aperture = pixel_size * width
+        # vertical_aperture = pixel_size * height
+        # fx, fy 可不同（非正方形像素），set_focal_length 僅接受單值，用 fx 與 horizontal_aperture 對應
+        # 實際投影由 set_opencv_pinhole_properties 的 fx, fy 分別控制
+        # focal_length = pixel_size * fy
+
+        cam = Camera(
+            prim_path=cam_path,
+            resolution=(width, height),
+            frequency=None,
+            render_product_path=render_product_path,
+        )
+        cam.initialize(attach_rgb_annotator=False)
+
+        # cam.set_focal_length(focal_length)
+        # cam.set_lens_aperture(0.0)
+        # cam.set_horizontal_aperture(horizontal_aperture, maintain_square_pixels=False)
+        # cam.set_vertical_aperture(vertical_aperture, maintain_square_pixels=False)
+        cam.set_clipping_range(float(near), float(far))
+        cam.set_opencv_pinhole_properties(cx=cx, cy=cy, fx=fx, fy=fy, pinhole=[0.0] * 12)
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -537,33 +592,58 @@ class IsaacSimEnv:
 
 
 # ----------------------------------------------------------------------
-if __name__ == "__main__":
+def _resolve_clip_root(input_dir: str) -> str:
+    """Resolve input_dir to the directory that directly contains clip subdirs.
+
+    - If input_dir is IK output root (e.g. outputs/ik), clips are in input_dir/data.
+    - If input_dir already contains clip subdirs (e.g. outputs/ik/data), use as is.
+    """
+    if not os.path.isdir(input_dir):
+        return input_dir
+    # Check if this dir has clip subdirs (any subdir with meta.json)
+    for name in os.listdir(input_dir):
+        path = os.path.join(input_dir, name)
+        if os.path.isdir(path) and os.path.isfile(os.path.join(path, "meta.json")):
+            return input_dir  # Already has clips
+    # No clips here; try input_dir/data (IK output layout)
+    data_sub = os.path.join(input_dir, "data")
+    if os.path.isdir(data_sub):
+        return data_sub
+    return input_dir
+
+
+def _gather_clip_dirs(input_dir: str) -> list[str]:
+    """Return sorted list of valid clip directories (each has meta.json + joint_trajectory.json)."""
+    root = _resolve_clip_root(input_dir)
+    if not os.path.isdir(root):
+        return []
+    out = []
+    for name in sorted(os.listdir(root)):
+        path = os.path.join(root, name)
+        if not os.path.isdir(path):
+            continue
+        if os.path.isfile(os.path.join(path, "meta.json")) and os.path.isfile(
+            os.path.join(path, "joint_trajectory.json")
+        ):
+            out.append(os.path.abspath(path))
+    return out
+
+
+def _render_single_clip(env: IsaacSimEnv, data_dir: str, opts: argparse.Namespace | dict) -> dict | None:
+    """Render one clip; returns stats dict or None on failure."""
     import json
 
-    parser = build_parser()
-    parser.add_argument(
-        "--data-dir",
-        type=str,
-        default=None,
-        help="Clip data directory containing meta.json & joint_trajectory.json",
-    )
-    args = parser.parse_args()
+    try:
+        with open(os.path.join(data_dir, "meta.json")) as f:
+            meta = json.load(f)
+        with open(os.path.join(data_dir, "joint_trajectory.json")) as f:
+            traj_data = json.load(f)
+    except Exception as e:
+        print(f"[IsaacSimEnv] Failed to load {data_dir}: {e}")
+        return None
 
-    # Pick a clip directory
-    if args.data_dir:
-        data_dir = args.data_dir
-    else:
-        ik_data_root = os.path.join(os.path.dirname(__file__), "..", "outputs", "ik", "data")
-        clips = sorted(os.listdir(ik_data_root))
-        if not clips:
-            raise FileNotFoundError(f"No clip directories found in {ik_data_root}")
-        data_dir = os.path.join(ik_data_root, clips[0])
-        print(f"[IsaacSimEnv] Auto-selected clip: {clips[0]}")
-
-    with open(os.path.join(data_dir, "meta.json")) as f:
-        meta = json.load(f)
-    with open(os.path.join(data_dir, "joint_trajectory.json")) as f:
-        traj_data = json.load(f)
+    def _get(key: str, default=None):
+        return opts.get(key, default) if isinstance(opts, dict) else getattr(opts, key, default)
 
     # Camera from extrinsics (4x4 camera-to-world, OpenCV convention)
     cam_ext = np.array(meta["camera_extrinsics"], dtype=np.float64)
@@ -572,74 +652,93 @@ if __name__ == "__main__":
     up = -cam_ext[:3, 1]
     target = eye + forward
 
-    args.view_eye = ",".join(str(v) for v in eye)
-    args.view_target = ",".join(str(v) for v in target)
-    args.view_up = ",".join(str(v) for v in up)
+    from isaacsim.core.utils.viewports import set_camera_view
 
-    img_size = meta.get("img_size", [896, 504])
-    render_size = getattr(args, "render_size", None)
-    if render_size is not None and render_size > 0:
-        args.render_width = args.render_height = render_size
-        print(f"[IsaacSimEnv] Render size: {render_size}x{render_size}")
-    else:
-        args.render_width = img_size[0]
-        args.render_height = img_size[1]
-    scale = getattr(args, "render_scale", 1.0)
+    set_camera_view(eye=eye, target=target, camera_prim_path="/OmniverseKit_Persp")
+    IsaacSimEnv._apply_camera_up(env.stage, "/OmniverseKit_Persp", eye, target, up)
+
+    # Scale intrinsics to render resolution (ego_overlay convention)
+    render_w = _get("render_width", 512)
+    render_h = _get("render_height", 512)
+    scale = _get("render_scale", 1.0)
     if scale != 1.0:
-        print(f"[IsaacSimEnv] Render scale {scale} -> {int(img_size[0]*scale)}x{int(img_size[1]*scale)}")
+        render_w = int(render_w * scale)
+        render_h = int(render_h * scale)
+    img_size = meta.get("img_size", [512, 512])
+    img_w, img_h = max(1, img_size[0]), max(1, img_size[1])
+    K = np.array(meta.get("camera_intrinsics", [[512, 0, 256], [0, 512, 256], [0, 0, 1]]), dtype=np.float64)
+    scale_x = render_w / img_w
+    scale_y = render_h / img_h
+    K_scaled = K.copy()
+    K_scaled[0, 0] *= scale_x
+    K_scaled[1, 1] *= scale_y
+    K_scaled[0, 2] *= scale_x
+    K_scaled[1, 2] *= scale_y
 
-    env = IsaacSimEnv(args)
+    fx, fy = float(K_scaled[0, 0]), float(K_scaled[1, 1])
+    cx, cy = float(K_scaled[0, 2]), float(K_scaled[1, 2])
+    # Omniverse 相機使用方像素，fx!=fy 時需渲染尺寸調整
+    render_h_actual = render_h
+    needs_resize = False
+    if abs(fx - fy) > 1e-3:
+        render_h_actual = max(1, int(round(render_h * fx / fy)))
+        K_scaled[1, 1] = fx
+        K_scaled[1, 2] = cy * render_h_actual / render_h
+        needs_resize = render_h_actual != render_h
 
-    # Playback trajectory with optional render + save
+    near_plane = float(meta.get("camera_near", 0.01))
+    far_plane = float(meta.get("camera_far", 10.0))
+    rp_path = None
+    if env._render_product is not None:
+        rp_path = getattr(env._render_product, "path", env._render_product)
+    IsaacSimEnv._set_camera_intrinsics_opencv(
+        "/OmniverseKit_Persp",
+        K_scaled,
+        width=render_w,
+        height=render_h_actual,
+        near=near_plane,
+        far=far_plane,
+        render_product_path=rp_path,
+    )
+
     left_traj = traj_data["left_joint_trajectory"]
     right_traj = traj_data["right_joint_trajectory"]
     n_frames = min(len(left_traj), len(right_traj))
-    output_dir = getattr(args, "output_dir", None)
+
+    output_dir = _get("output_dir")
     do_render = output_dir and env._render_product is not None
 
     do_overlay = False
+    source_reader = None
+    writer = None
+    fps_meta = meta.get("fps", 30)
+    clip_id = meta.get("clip_id", os.path.basename(data_dir.rstrip("/")))
+    output_video_path = os.path.join(output_dir, f"{clip_id}.mp4") if output_dir else None
+
+    render_w = _get("render_width", 512)
+    render_h = _get("render_height", 512)
+    scale = _get("render_scale", 1.0)
+    if scale != 1.0:
+        render_w = int(render_w * scale)
+        render_h = int(render_h * scale)
+
     if do_render:
         os.makedirs(output_dir, exist_ok=True)
-        clip_id = meta.get("clip_id", os.path.basename(data_dir.rstrip("/")))
-        output_video_path = os.path.join(output_dir, f"{clip_id}.mp4")
-        stats_path = os.path.join(output_dir, "render_stats.json")
-        fps_meta = meta.get("fps", 30)
-        video_path = getattr(args, "video_path", None) or meta.get("video_path")
-        source_reader = None
-        if not getattr(args, "no_overlay", False) and video_path:
-            if not os.path.isfile(video_path):
-                print(f"[IsaacSimEnv] Video not found: {video_path}")
-            else:
-                try:
-                    import imageio
-                    source_reader = imageio.get_reader(video_path)
-                    do_overlay = True
-                    print(f"[IsaacSimEnv] Overlay onto {video_path}")
-                except Exception as e:
-                    print(f"[IsaacSimEnv] Cannot load source video: {e}")
-                    source_reader = None
-        if not do_overlay:
-            print("[IsaacSimEnv] No source video, outputting seg only")
+        video_path = _get("video_path") or meta.get("video_path")
+        if not _get("no_overlay", False) and video_path and os.path.isfile(video_path):
+            try:
+                import imageio
+
+                source_reader = imageio.get_reader(video_path)
+                do_overlay = True
+            except Exception:
+                source_reader = None
         try:
             import imageio
-            from PIL import Image
+
+            writer = imageio.get_writer(output_video_path, fps=fps_meta, codec="libx264", macro_block_size=1)
         except ImportError:
-            imageio = Image = None
-        writer = None
-        if imageio is not None:
-            writer = imageio.get_writer(
-                output_video_path, fps=fps_meta, codec="libx264", macro_block_size=1
-            )
-        render_w, render_h = args.render_width, args.render_height
-        scale = getattr(args, "render_scale", 1.0)
-        if scale != 1.0:
-            render_w = int(render_w * scale)
-            render_h = int(render_h * scale)
-        print(f"[IsaacSimEnv] Rendering {n_frames} frames to {output_dir}")
-    else:
-        writer = source_reader = None
-        render_w = render_h = 0
-        print(f"[IsaacSimEnv] Playing {n_frames} frames from {data_dir}")
+            writer = None
 
     t_start = time.time()
     for frame_idx in range(n_frames):
@@ -654,10 +753,29 @@ if __name__ == "__main__":
                 rgb, seg = result
                 robot_rgb = np.asarray(rgb[:, :, :3], dtype=np.uint8)
                 mask = (seg > 0).astype(np.uint8)
+                if needs_resize and (robot_rgb.shape[0], robot_rgb.shape[1]) != (render_h, render_w):
+                    try:
+                        from PIL import Image
+
+                        robot_rgb = np.asarray(
+                            Image.fromarray(robot_rgb).resize((render_w, render_h), Image.BILINEAR)
+                        )
+                        mask = np.asarray(
+                            Image.fromarray(mask.astype(np.uint8) * 255).resize(
+                                (render_w, render_h), Image.NEAREST
+                            )
+                        ) > 127
+                    except ImportError:
+                        pass
+
+                try:
+                    from PIL import Image
+                except ImportError:
+                    Image = None
 
                 if do_overlay and source_reader is not None and Image is not None:
                     try:
-                        bg = np.asarray(source_reader.get_data(frame_idx))
+                        bg = np.asarray(source_reader.get_data(frame_idx)).copy()
                     except (IndexError, Exception):
                         bg = None
                     if bg is not None:
@@ -667,9 +785,7 @@ if __name__ == "__main__":
                             bg = bg[..., :3]
                         bg_h, bg_w = bg.shape[:2]
                         if (bg_w, bg_h) != (render_w, render_h):
-                            bg = np.asarray(
-                                Image.fromarray(bg).resize((render_w, render_h), Image.BILINEAR)
-                            )
+                            bg = np.asarray(Image.fromarray(bg).resize((render_w, render_h), Image.BILINEAR))
                         if robot_rgb.shape[:2] != (render_h, render_w):
                             robot_rgb = np.asarray(
                                 Image.fromarray(robot_rgb).resize((render_w, render_h), Image.BILINEAR)
@@ -680,6 +796,7 @@ if __name__ == "__main__":
                                 )
                                 > 127
                             )
+                        bg = np.asarray(bg, dtype=np.uint8).copy()
                         bg[mask.astype(bool)] = robot_rgb[mask.astype(bool)]
                         out_frame = bg
                     else:
@@ -687,28 +804,269 @@ if __name__ == "__main__":
                 else:
                     out_frame = np.stack([mask * 255] * 3, axis=-1)
                 writer.append_data(out_frame[:, :, :3])
-            if (frame_idx + 1) % 50 == 0 or frame_idx == n_frames - 1:
-                print(f"  {frame_idx + 1}/{n_frames}")
         elif not do_render:
             env.set_joint(left_q, right_q)
             env.step()
 
-    if do_render and source_reader is not None:
+    if source_reader is not None:
         source_reader.close()
     t_elapsed = time.time() - t_start
-    if do_render and writer is not None:
+
+    if writer is not None:
         writer.close()
         render_fps = n_frames / t_elapsed if t_elapsed > 0 else 0.0
-        stats = {
+        return {
+            "clip_id": clip_id,
             "n_frames": n_frames,
             "elapsed_seconds": round(t_elapsed, 2),
             "render_fps": round(render_fps, 2),
             "output_video_fps": fps_meta,
             "overlay": do_overlay,
         }
-        with open(stats_path, "w") as f:
-            json.dump(stats, f, indent=2)
-        print(f"[IsaacSimEnv] Saved {output_video_path}")
-        print(f"[IsaacSimEnv] Render FPS: {render_fps:.1f} ({n_frames} frames in {t_elapsed:.1f}s)")
+    return None
 
-    env.close()
+
+# ----------------------------------------------------------------------
+@ray.remote(max_restarts=3, max_task_retries=0)
+class IsaacSimWorkerActor:
+    """One Isaac Sim app per process; init once, process multiple clips."""
+
+    def __init__(
+        self,
+        urdf_path: str,
+        headless: bool,
+        render_size: int,
+        render_scale: float,
+        no_overlay: bool,
+        video_path: str | None = None,
+    ):
+        self._app = None
+        self._env = None
+        self._urdf_path = urdf_path
+        self._headless = headless
+        self._render_size = render_size
+        self._render_scale = render_scale
+        self._no_overlay = no_overlay
+        self._video_path = video_path
+        self._init_app()
+
+    def _init_app(self) -> None:
+        from isaacsim import SimulationApp
+
+        app_config = {
+            "headless": self._headless,
+            "width": 1280,
+            "height": 720,
+        }
+        if self._headless:
+            app_config["windowless"] = True
+        self._app = SimulationApp(app_config)
+
+        parser = build_parser()
+        args = parser.parse_args([])
+        args.urdf_path = self._urdf_path
+        args.headless = self._headless
+        args.render_size = self._render_size
+        args.render_scale = self._render_scale
+        args.render_width = args.render_height = self._render_size
+        args.no_overlay = self._no_overlay
+        self._env = IsaacSimEnv(args)
+
+    def process_clips(
+        self,
+        clip_dirs: list[str],
+        output_dir: str,
+        worker_id: int,
+    ) -> list[dict]:
+        opts = {
+            "output_dir": output_dir,
+            "render_width": self._render_size,
+            "render_height": self._render_size,
+            "render_scale": self._render_scale,
+            "no_overlay": self._no_overlay,
+            "video_path": self._video_path,
+        }
+        results = []
+        tag = f"[IsaacSim GPU{worker_id}]"
+        for i, data_dir in enumerate(clip_dirs):
+            clip_name = os.path.basename(data_dir.rstrip("/"))
+            print(f"{tag} [{i+1}/{len(clip_dirs)}] {clip_name}", flush=True)
+            try:
+                stats = _render_single_clip(self._env, data_dir, opts)
+                if stats is not None:
+                    results.append(stats)
+                    print(f"  Saved, FPS: {stats['render_fps']:.1f}", flush=True)
+                else:
+                    results.append({"clip_id": clip_name, "error": "render failed"})
+            except Exception as e:
+                results.append({"clip_id": clip_name, "error": str(e)})
+                print(f"  Error: {e}", flush=True)
+        return results
+
+    def shutdown(self) -> None:
+        if self._env is not None:
+            try:
+                self._env.close()
+            except Exception:
+                pass
+        self._env = None
+        self._app = None
+
+
+def _run_ray_batch(args: argparse.Namespace, clip_dirs: list[str]) -> None:
+    """Ray multi-GPU batch: one process per GPU, each init app once."""
+    ray_kwargs = {}
+    if getattr(args, "num_gpus", None) is not None:
+        ray_kwargs["num_gpus"] = args.num_gpus
+    ray.init(**ray_kwargs)
+
+    cluster = ray.cluster_resources()
+    total_gpus = cluster.get("GPU", 0)
+    num_workers = max(1, int(total_gpus)) if total_gpus > 0 else 1
+    gpus_per_worker = total_gpus / num_workers if total_gpus > 0 else 0
+
+    worker_clips: list[list[str]] = [[] for _ in range(num_workers)]
+    for i, cd in enumerate(clip_dirs):
+        worker_clips[i % num_workers].append(cd)
+    active: list[tuple[int, list[str]]] = [
+        (w, clips) for w, clips in enumerate(worker_clips) if clips
+    ]
+
+    print(f"[IsaacSim] Ray batch: {len(clip_dirs)} clips, {len(active)} workers "
+          f"({total_gpus} GPUs)")
+    for w, clips in active:
+        print(f"  Worker {w}: {len(clips)} clips")
+
+    actor_options = {"num_cpus": 1.0}
+    if gpus_per_worker > 0:
+        actor_options["num_gpus"] = gpus_per_worker
+
+    futures = []
+    for w, clips in active:
+        actor = IsaacSimWorkerActor.options(**actor_options).remote(
+            urdf_path=args.urdf_path,
+            headless=args.headless,
+            render_size=getattr(args, "render_size", 512),
+            render_scale=getattr(args, "render_scale", 1.0),
+            no_overlay=args.no_overlay,
+            video_path=getattr(args, "video_path", None),
+        )
+        fut = actor.process_clips.remote(clips, args.output_dir, w)
+        futures.append((fut, w, actor))
+
+    all_results = []
+    for fut, w, actor in futures:
+        try:
+            worker_results = ray.get(fut)
+            all_results.extend(worker_results)
+            n_ok = sum(1 for r in worker_results if "error" not in r)
+            print(f"[IsaacSim] Worker {w}: {n_ok}/{len(worker_results)} ok")
+        except Exception as e:
+            print(f"[IsaacSim] Worker {w} failed: {e}")
+        try:
+            ray.get(actor.shutdown.remote(), timeout=5)
+        except Exception:
+            pass
+
+    summary = {
+        "total": len(clip_dirs),
+        "success": sum(1 for r in all_results if "error" not in r),
+        "failed": sum(1 for r in all_results if "error" in r),
+        "clips": all_results,
+    }
+    summary_path = os.path.join(args.output_dir, "render_stats.json")
+    os.makedirs(args.output_dir, exist_ok=True)
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[IsaacSim] Done: {summary['success']}/{summary['total']} ok -> {summary_path}")
+    ray.shutdown()
+
+
+# ----------------------------------------------------------------------
+if __name__ == "__main__":
+    import json
+
+    parser = build_parser()
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default=None,
+        help="Single clip directory (meta.json + joint_trajectory.json)",
+    )
+    parser.add_argument(
+        "--input-dir",
+        type=str,
+        default=None,
+        help="IK output dir (outputs/ik) or data dir (outputs/ik/data). Process all clips within.",
+    )
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=None,
+        help="Total GPUs for Ray (default: all). One worker per GPU.",
+    )
+    args = parser.parse_args()
+
+    # Determine clip directories
+    clip_dirs: list[str] = []
+    if args.data_dir and os.path.isdir(args.data_dir):
+        meta_path = os.path.join(args.data_dir, "meta.json")
+        if os.path.isfile(meta_path):
+            clip_dirs = [os.path.abspath(args.data_dir)]
+        else:
+            # data_dir might be IK root (outputs/ik) or data parent (outputs/ik/data)
+            clip_dirs = _gather_clip_dirs(args.data_dir)
+            if clip_dirs:
+                print(f"[IsaacSimEnv] Resolved --data-dir to {len(clip_dirs)} clips")
+    elif args.input_dir and os.path.isdir(args.input_dir):
+        clip_dirs = _gather_clip_dirs(args.input_dir)
+    else:
+        ik_root = os.path.join(os.path.dirname(__file__), "..", "outputs", "ik")
+        clip_dirs = _gather_clip_dirs(ik_root)
+        if not clip_dirs:
+            raise FileNotFoundError(f"No clip directories in {ik_root} or {os.path.join(ik_root, 'data')}")
+        if not args.input_dir and not args.data_dir:
+            clip_dirs = [clip_dirs[0]]
+            print(f"[IsaacSimEnv] Auto-selected single clip: {os.path.basename(clip_dirs[0])}")
+
+    if not clip_dirs:
+        raise FileNotFoundError("No valid clip directories")
+
+    # Ray batch: input-dir + output-dir -> one process per GPU
+    use_ray = args.input_dir and args.output_dir and len(clip_dirs) > 0
+    if use_ray:
+        _run_ray_batch(args, clip_dirs)
+    else:
+        # Single-process: one env, process clips sequentially
+        data_dir = clip_dirs[0]
+        with open(os.path.join(data_dir, "meta.json")) as f:
+            meta = json.load(f)
+        img_size = meta.get("img_size", [512, 512])
+        render_size = getattr(args, "render_size", None)
+        if render_size is not None and render_size > 0:
+            args.render_width = args.render_height = render_size
+        else:
+            args.render_width = img_size[0]
+            args.render_height = img_size[1]
+
+        env = IsaacSimEnv(args)
+        output_dir = getattr(args, "output_dir", None)
+        do_render = output_dir and env._render_product is not None
+        if do_render:
+            os.makedirs(output_dir, exist_ok=True)
+
+        all_stats = []
+        for i, clip_dir in enumerate(clip_dirs):
+            clip_name = os.path.basename(clip_dir.rstrip("/"))
+            print(f"[IsaacSimEnv] [{i+1}/{len(clip_dirs)}] {clip_name}")
+            stats = _render_single_clip(env, clip_dir, args)
+            if stats is not None:
+                all_stats.append(stats)
+                if do_render:
+                    print(f"  Saved, FPS: {stats['render_fps']:.1f}")
+
+        if do_render and output_dir and all_stats:
+            summary = {"clips": all_stats, "total_clips": len(all_stats), "failed": len(clip_dirs) - len(all_stats)}
+            with open(os.path.join(output_dir, "render_stats.json"), "w") as f:
+                json.dump(summary, f, indent=2)
+        env.close()

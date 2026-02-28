@@ -855,34 +855,51 @@ def print_ik_error_report(
 # -----------------------------------------------------------------------------
 # Rendering: view/projection from camera_matrix and camera_intrinsics
 # -----------------------------------------------------------------------------
-def build_projection_matrix_from_intrinsics(
-    camera_intrinsics: np.ndarray,
-    width: int,
-    height: int,
-    near: float = 0.01,
-    far: float = 10.0,
-) -> list[float]:
-    """
-    Build PyBullet/OpenGL projection matrix (column-major 16-element list) from 3x3 intrinsics K (fx,fy,cx,cy) and image size.
-    """
-    K = np.asarray(camera_intrinsics, dtype=np.float64)
-    if K.shape == (3, 3):
-        fx, fy = K[0, 0], K[1, 1]
-        cx, cy = K[0, 2], K[1, 2]
-    else:
-        fx = fy = K.flat[0] if K.size >= 1 else 600.0
-        cx, cy = width / 2.0, height / 2.0
+# def build_projection_matrix_from_intrinsics(
+#     camera_intrinsics: np.ndarray,
+#     width: int,
+#     height: int,
+#     near: float = 0.01,
+#     far: float = 10.0,
+# ) -> list[float]:
+#     """
+#     Build PyBullet/OpenGL projection matrix (column-major 16-element list) from 3x3 intrinsics K (fx,fy,cx,cy) and image size.
+#     """
+#     K = np.asarray(camera_intrinsics, dtype=np.float64)
+#     if K.shape == (3, 3):
+#         fx, fy = K[0, 0], K[1, 1]
+#         cx, cy = K[0, 2], K[1, 2]
+#     else:
+#         fx = fy = K.flat[0] if K.size >= 1 else 600.0
+#         cx, cy = width / 2.0, height / 2.0
+#     A = (near + far) / (near - far)
+#     B = 2.0 * near * far / (near - far)
+#     # Projection matrix consistent with OpenGL/PyBullet (see cvK2BulletP)
+#     P = np.array([
+#         [2.0 / width * fx, 0, 0, 0],
+#         [0, 2.0 / height * fy, 0, 0],
+#         [(width - 2.0 * cx) / width, (2.0 * cy - height) / height, A, B],
+#         [0, 0, -1, 0],
+#     ], dtype=np.float64)
+#     return P.T.ravel().tolist()
+
+def build_projection_matrix_from_intrinsics(K, width, height, near=0.01, far=10.0):
+    K = np.asarray(K, dtype=np.float64)
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+
     A = (near + far) / (near - far)
     B = 2.0 * near * far / (near - far)
-    # Projection matrix consistent with OpenGL/PyBullet (see cvK2BulletP)
-    P = np.array([
-        [2.0 / width * fx, 0, 0, 0],
-        [0, 2.0 / height * fy, 0, 0],
-        [(width - 2.0 * cx) / width, (2.0 * cy - height) / height, A, B],
-        [0, 0, -1, 0],
-    ], dtype=np.float64)
-    return P.T.ravel().tolist()
 
+    # OpenCV K -> OpenGL/PyBullet projection (row-major), then transpose->column-major list
+    P = np.array([
+        [2.0 * fx / width,           0.0,  (width - 2.0 * cx) / width, 0.0],
+        [0.0,            2.0 * fy / height, (2.0 * cy - height) / height, 0.0],
+        [0.0,                         0.0,                      A,     B],
+        [0.0,                         0.0,                     -1.0,   0.0],
+    ], dtype=np.float64)
+
+    return P.T.ravel().tolist()  # column-major 16 floats
 
 def build_view_matrix_from_camera_matrix(camera_matrix: np.ndarray) -> list[float]:
     """
