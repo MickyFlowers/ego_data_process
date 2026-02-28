@@ -11,7 +11,7 @@ def main(args):
 
     # os.scandir is faster than glob for large directories (single getdents vs many stats)
     with os.scandir(input_dir) as it:
-        all_clips = sorted([Path(p.path) for p in it if p.is_dir()])
+        all_clips = [Path(p.path) for p in it]
     num_clips = len(all_clips)
 
     # 将 all_clips 均分为 num_parts 部分
