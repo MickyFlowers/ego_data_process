@@ -644,6 +644,19 @@ def _filter_pending_clips(clip_dirs: list[str], output_dir: str, verify_video: b
     video_dir = os.path.abspath(os.path.join(output_dir, "video"))
     print(f"[IsaacSim] Output video dir: {video_dir}", flush=True)
 
+    # Remove stale .tmp.mp4 from previous interrupted runs
+    if os.path.isdir(video_dir):
+        removed = 0
+        for f in os.listdir(video_dir):
+            if f.endswith(".tmp.mp4"):
+                try:
+                    os.remove(os.path.join(video_dir, f))
+                    removed += 1
+                except OSError:
+                    pass
+        if removed:
+            print(f"[IsaacSim] Removed {removed} stale .tmp.mp4 file(s)", flush=True)
+
     clip_id_to_dir = {os.path.basename(d.rstrip("/")): d for d in clip_dirs}
 
     if not os.path.isdir(video_dir):
