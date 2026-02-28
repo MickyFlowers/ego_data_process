@@ -145,6 +145,7 @@ def render_worker(
     render_width: int,
     render_height: int,
     worker_id: int,
+    seg_only: bool = False,
 ) -> list[dict]:
     """Ray remote: init PyBullet once with EGL, then render all assigned clips."""
     import pybullet as p
@@ -172,7 +173,9 @@ def render_worker(
             egl_loaded = True
     except Exception:
         pass
-    renderer = p.ER_BULLET_HARDWARE_OPENGL if egl_loaded else p.ER_TINY_RENDERER
+    renderer = p.ER_TINY_RENDERER if seg_only else (
+        p.ER_BULLET_HARDWARE_OPENGL if egl_loaded else p.ER_TINY_RENDERER
+    )
 
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
     p.setGravity(0, 0, 0)
@@ -230,17 +233,21 @@ def render_worker(
         proj_matrix = build_projection_matrix_from_intrinsics(
             render_K, render_width, render_height)
 
-        # ---- Source video for overlay ----
-        video_path = meta.get("video_path")
+        # ---- Source video for overlay (skip when seg_only) ----
         source_reader = None
-        if video_path and os.path.isfile(video_path):
-            try:
-                source_reader = imageio.get_reader(video_path)
-            except Exception:
-                source_reader = None
+        if not seg_only:
+            video_path = meta.get("video_path")
+            if video_path and os.path.isfile(video_path):
+                try:
+                    source_reader = imageio.get_reader(video_path)
+                except Exception:
+                    source_reader = None
 
-        # ---- Output writer ----
-        out_path = os.path.join(output_dir, "video", f"{clip_id}.mp4")
+        # ---- Output ----
+        if seg_only:
+            out_path = os.path.join(output_dir, f"{clip_id}.mp4")
+        else:
+            out_path = os.path.join(output_dir, "video", f"{clip_id}.mp4")
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         writer = imageio.get_writer(
             out_path, fps=fps, codec="libx264", macro_block_size=1,
@@ -249,6 +256,7 @@ def render_worker(
 
         written = 0
         need_resize: bool | None = None
+        t_clip_start = time.time()
 
         for fi in range(n_frames):
             lq = left_traj[fi]
@@ -260,82 +268,101 @@ def render_worker(
             rg = float(rq[6]) if len(rq) > 6 else 0.0
             set_gripper(robot_info, lg, rg)
 
-            # Multi-light render: simulate multiple light sources by
-            # rendering several passes with different directions and blending.
-            light_configs = [
-                # (direction,       weight, shadow)  — primary key light
-                ([0.5,  0.0,  1.5], 0.45,   1),
-                # fill light from the left
-                ([-1.0, 0.5,  0.8], 0.30,   0),
-                # back/rim light
-                ([0.0, -0.5,  1.0], 0.25,   0),
-            ]
-
-            accum = np.zeros((render_height, render_width, 3), dtype=np.float64)
-            seg_out = None
-            for l_dir, l_weight, l_shadow in light_configs:
-                _, _, _rgba, _, _seg = p.getCameraImage(
+            if seg_only:
+                _, _, _, _, _seg = p.getCameraImage(
                     render_width, render_height,
                     viewMatrix=view_matrix,
                     projectionMatrix=proj_matrix,
-                    shadow=l_shadow,
-                    lightDirection=l_dir,
-                    lightColor=[1.0, 1.0, 1.0],
-                    lightDistance=2.0,
-                    lightAmbientCoeff=0.3,
-                    lightDiffuseCoeff=0.8,
-                    lightSpecularCoeff=0.2,
+                    shadow=0,
                     renderer=renderer,
                 )
-                _rgb = np.asarray(_rgba, dtype=np.uint8).reshape(
-                    (render_height, render_width, 4))[:, :, :3]
-                accum += _rgb.astype(np.float64) * l_weight
-                if seg_out is None:
-                    seg_out = _seg
-
-            robot_rgb = np.clip(accum, 0, 255).astype(np.uint8)
-            mask = np.asarray(seg_out).reshape((render_height, render_width)) >= 0
-
-            # Read source frame
-            bg = None
-            if source_reader is not None:
-                try:
-                    bg = np.asarray(source_reader.get_data(fi))
-                except (IndexError, Exception):
-                    bg = None
-
-            if bg is not None:
-                if bg.ndim == 2:
-                    bg = np.stack([bg] * 3, axis=-1)
-                elif bg.shape[-1] == 4:
-                    bg = bg[..., :3]
-                bg_h, bg_w = bg.shape[:2]
-
-                if need_resize is None:
-                    need_resize = (render_width, render_height) != (bg_w, bg_h)
-                if need_resize:
-                    robot_rgb = np.asarray(
-                        Image.fromarray(robot_rgb).resize(
-                            (bg_w, bg_h), Image.BILINEAR))
-                    mask = np.asarray(
-                        Image.fromarray(mask.astype(np.uint8) * 255).resize(
-                            (bg_w, bg_h), Image.NEAREST)) > 127
-
-                bg[mask] = robot_rgb[mask]
-
-                if (bg_w, bg_h) != (render_width, render_height):
-                    bg = np.asarray(
-                        Image.fromarray(bg).resize(
-                            (render_width, render_height), Image.BILINEAR))
-                writer.append_data(bg[:, :, :3])
+                mask = (np.asarray(_seg).reshape((render_height, render_width)) >= 0).astype(np.uint8) * 255
+                writer.append_data(np.stack([mask] * 3, axis=-1))
             else:
-                writer.append_data(robot_rgb)
+                # Multi-light render
+                light_configs = [
+                    ([0.5,  0.0,  1.5], 0.45,   1),
+                    ([-1.0, 0.5,  0.8], 0.30,   0),
+                    ([0.0, -0.5,  1.0], 0.25,   0),
+                ]
+                accum = np.zeros((render_height, render_width, 3), dtype=np.float64)
+                seg_out = None
+                for l_dir, l_weight, l_shadow in light_configs:
+                    _, _, _rgba, _, _seg = p.getCameraImage(
+                        render_width, render_height,
+                        viewMatrix=view_matrix,
+                        projectionMatrix=proj_matrix,
+                        shadow=l_shadow,
+                        lightDirection=l_dir,
+                        lightColor=[1.0, 1.0, 1.0],
+                        lightDistance=2.0,
+                        lightAmbientCoeff=0.3,
+                        lightDiffuseCoeff=0.8,
+                        lightSpecularCoeff=0.2,
+                        renderer=renderer,
+                    )
+                    _rgb = np.asarray(_rgba, dtype=np.uint8).reshape(
+                        (render_height, render_width, 4))[:, :, :3]
+                    accum += _rgb.astype(np.float64) * l_weight
+                    if seg_out is None:
+                        seg_out = _seg
+
+                robot_rgb = np.clip(accum, 0, 255).astype(np.uint8)
+                mask = np.asarray(seg_out).reshape((render_height, render_width)) >= 0
+
+                bg = None
+                if source_reader is not None:
+                    try:
+                        bg = np.asarray(source_reader.get_data(fi))
+                    except (IndexError, Exception):
+                        bg = None
+
+                if bg is not None:
+                    if bg.ndim == 2:
+                        bg = np.stack([bg] * 3, axis=-1)
+                    elif bg.shape[-1] == 4:
+                        bg = bg[..., :3]
+                    bg_h, bg_w = bg.shape[:2]
+
+                    if need_resize is None:
+                        need_resize = (render_width, render_height) != (bg_w, bg_h)
+                    if need_resize:
+                        robot_rgb = np.asarray(
+                            Image.fromarray(robot_rgb).resize(
+                                (bg_w, bg_h), Image.BILINEAR))
+                        mask = np.asarray(
+                            Image.fromarray(mask.astype(np.uint8) * 255).resize(
+                                (bg_w, bg_h), Image.NEAREST)) > 127
+
+                    bg[mask] = robot_rgb[mask]
+
+                    if (bg_w, bg_h) != (render_width, render_height):
+                        bg = np.asarray(
+                            Image.fromarray(bg).resize(
+                                (render_width, render_height), Image.BILINEAR))
+                    writer.append_data(bg[:, :, :3])
+                else:
+                    writer.append_data(robot_rgb)
 
             written += 1
 
         if source_reader is not None:
             source_reader.close()
         writer.close()
+
+        if seg_only:
+            t_clip = time.time() - t_clip_start
+            render_fps = written / t_clip if t_clip > 0 else 0
+            stats_path = os.path.join(output_dir, "render_stats.json")
+            stats = {
+                "clip_id": clip_id,
+                "n_frames": written,
+                "elapsed_seconds": round(t_clip, 2),
+                "render_fps": round(render_fps, 2),
+                "output_video_fps": fps,
+            }
+            with open(stats_path, "w") as f:
+                json.dump(stats, f, indent=2)
 
         total_frames_written += written
         results.append({
@@ -392,6 +419,8 @@ def main():
                         help="Total CPUs for Ray (default: all)")
     parser.add_argument("--num-gpus", type=int, default=None,
                         help="Total GPUs for Ray (default: all)")
+    parser.add_argument("--seg-only", action="store_true",
+                        help="Output segmentation mask only (much faster, 60+ FPS)")
     args = parser.parse_args()
 
     # ---- Discover clips ----
@@ -441,7 +470,8 @@ def main():
         (w, clips) for w, clips in enumerate(worker_clips) if clips
     ]
 
-    os.makedirs(os.path.join(args.output_dir, "video"), exist_ok=True)
+    if not args.seg_only:
+        os.makedirs(os.path.join(args.output_dir, "video"), exist_ok=True)
 
     print(f"[Render] {n_render}/{n_total} clips, {len(active)} workers "
           f"({total_cpus} CPUs, {total_gpus} GPUs)")
@@ -465,6 +495,7 @@ def main():
             render_width=args.width,
             render_height=args.height,
             worker_id=w,
+            seg_only=args.seg_only,
         )
         future_to_worker[fut] = (w, clips)
         pending_futures.append(fut)
