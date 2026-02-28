@@ -642,6 +642,8 @@ def _filter_pending_clips(clip_dirs: list[str], output_dir: str, verify_video: b
     if not output_dir:
         return clip_dirs
     video_dir = os.path.join(output_dir, "video")
+    video_dir_abs = os.path.abspath(video_dir)
+    print(f"[IsaacSim] Output video dir: {video_dir_abs}", flush=True)
 
     pending = []
     to_verify: list[tuple[str, str]] = []
@@ -659,8 +661,14 @@ def _filter_pending_clips(clip_dirs: list[str], output_dir: str, verify_video: b
             to_verify.append((data_dir, out_path))
 
     if not to_verify:
+        if pending:
+            print(f"[IsaacSim] No existing videos to verify, {len(pending)} to render", flush=True)
         return pending
 
+    print(f"[IsaacSim] Verifying {len(to_verify)} videos in {video_dir_abs}", flush=True)
+    if to_verify:
+        _sample_out = os.path.abspath(to_verify[0][1])
+        print(f"[IsaacSim] Example path: {_sample_out}", flush=True)
     try:
         from tqdm import tqdm
         iter_verify = tqdm(to_verify, desc="Verify videos", unit="clip", file=sys.stdout)
@@ -673,6 +681,7 @@ def _filter_pending_clips(clip_dirs: list[str], output_dir: str, verify_video: b
             print(flush=True)
         iter_verify = _iter_with_progress()
 
+    n_failed = 0
     for data_dir, out_path in iter_verify:
         try:
             import imageio
@@ -683,7 +692,9 @@ def _filter_pending_clips(clip_dirs: list[str], output_dir: str, verify_video: b
                 r.close()
         except Exception:
             pending.append(data_dir)
+            n_failed += 1
 
+    print(f"[IsaacSim] Verify done: {len(to_verify) - n_failed} ok (skip), {n_failed} invalid, {len(pending)} total pending", flush=True)
     return pending
 
 
