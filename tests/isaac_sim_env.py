@@ -642,7 +642,9 @@ def _filter_pending_clips(clip_dirs: list[str], output_dir: str, verify_video: b
     if not output_dir:
         return clip_dirs
     video_dir = os.path.join(output_dir, "video")
+
     pending = []
+    to_verify: list[tuple[str, str]] = []
     for data_dir in clip_dirs:
         try:
             with open(os.path.join(data_dir, "meta.json")) as f:
@@ -653,17 +655,35 @@ def _filter_pending_clips(clip_dirs: list[str], output_dir: str, verify_video: b
         out_path = os.path.join(video_dir, f"{clip_id}.mp4")
         if not os.path.isfile(out_path):
             pending.append(data_dir)
-            continue
-        if verify_video:
+        elif verify_video:
+            to_verify.append((data_dir, out_path))
+
+    if not to_verify:
+        return pending
+
+    try:
+        from tqdm import tqdm
+        iter_verify = tqdm(to_verify, desc="Verify videos", unit="clip", file=sys.stdout)
+    except ImportError:
+        n_total = len(to_verify)
+        def _iter_with_progress():
+            for i, item in enumerate(to_verify):
+                print(f"\r[IsaacSim] Verify videos: {i + 1}/{n_total}", end="", flush=True)
+                yield item
+            print(flush=True)
+        iter_verify = _iter_with_progress()
+
+    for data_dir, out_path in iter_verify:
+        try:
+            import imageio
+            r = imageio.get_reader(out_path)
             try:
-                import imageio
-                r = imageio.get_reader(out_path)
-                try:
-                    r.get_data(0)
-                finally:
-                    r.close()
-            except Exception:
-                pending.append(data_dir)
+                r.get_data(0)
+            finally:
+                r.close()
+        except Exception:
+            pending.append(data_dir)
+
     return pending
 
 
