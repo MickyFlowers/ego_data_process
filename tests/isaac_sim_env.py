@@ -636,69 +636,71 @@ def _gather_clip_dirs(input_dir: str) -> list[str]:
 def _filter_pending_clips(clip_dirs: list[str], output_dir: str, verify_video: bool = False) -> list[str]:
     """Return clips that still need rendering.
 
-    Logic: for each clip in clip_dirs, if output video exists:
-    - verify_video=False: treat as done, skip
-    - verify_video=True: verify file integrity; if ok skip, else delete corrupt file and re-render
+    Logic: from output_dir/video/ get existing clip_ids, verify each. If ok -> remove from
+    clip_dirs (skip). If fail -> delete video. Return clip_dirs minus the skipped ones.
     """
     if not output_dir:
         return clip_dirs
     video_dir = os.path.abspath(os.path.join(output_dir, "video"))
     print(f"[IsaacSim] Output video dir: {video_dir}", flush=True)
 
-    def _get_clip_id(data_dir: str) -> str:
+    clip_id_to_dir = {}
+    for d in clip_dirs:
         try:
-            with open(os.path.join(data_dir, "meta.json")) as f:
-                return json.load(f).get("clip_id", os.path.basename(data_dir.rstrip("/")))
+            with open(os.path.join(d, "meta.json")) as f:
+                cid = json.load(f).get("clip_id", os.path.basename(d.rstrip("/")))
         except Exception:
-            return os.path.basename(data_dir.rstrip("/"))
+            cid = os.path.basename(d.rstrip("/"))
+        clip_id_to_dir[cid] = d
 
-    pending = []
-    to_verify: list[tuple[str, str]] = []  # (data_dir, out_path)
+    if not os.path.isdir(video_dir):
+        print(f"[IsaacSim] {len(clip_dirs)} to render (no output dir yet)", flush=True)
+        return clip_dirs
 
-    for data_dir in clip_dirs:
-        clip_id = _get_clip_id(data_dir)
-        out_path = os.path.join(video_dir, f"{clip_id}.mp4")
-        if not os.path.isfile(out_path):
-            pending.append(data_dir)
-        elif verify_video:
-            to_verify.append((data_dir, out_path))
-        # else: file exists, no verify -> skip
+    to_verify = []
+    for f in os.listdir(video_dir):
+        if not f.endswith(".mp4"):
+            continue
+        clip_id = f[:-4]
+        if clip_id not in clip_id_to_dir:
+            continue
+        to_verify.append((clip_id, os.path.join(video_dir, f)))
 
-    if not to_verify:
-        print(f"[IsaacSim] {len(pending)} to render", flush=True)
-        return pending
-
-    print(f"[IsaacSim] Verifying {len(to_verify)} videos in {video_dir}", flush=True)
-    try:
-        from tqdm import tqdm
-        it = tqdm(to_verify, desc="Verify videos", unit="clip", file=sys.stdout)
-    except ImportError:
-        n_total = len(to_verify)
-        def it():
-            for i, x in enumerate(to_verify):
-                print(f"\r[IsaacSim] Verify: {i + 1}/{n_total}", end="", flush=True)
-                yield x
-            print(flush=True)
-        it = it()
-
-    n_invalid = 0
-    for data_dir, out_path in it:
+    skip_ok = set()
+    if to_verify and verify_video:
+        print(f"[IsaacSim] Verifying {len(to_verify)} videos in {video_dir}", flush=True)
         try:
-            import imageio
-            r = imageio.get_reader(out_path)
-            try:
-                r.get_data(0)
-            finally:
-                r.close()
-        except Exception:
-            try:
-                os.remove(out_path)
-            except OSError:
-                pass
-            pending.append(data_dir)
-            n_invalid += 1
+            from tqdm import tqdm
+            it = tqdm(to_verify, desc="Verify videos", unit="clip", file=sys.stdout)
+        except ImportError:
+            n_total = len(to_verify)
+            def it():
+                for i, x in enumerate(to_verify):
+                    print(f"\r[IsaacSim] Verify: {i + 1}/{n_total}", end="", flush=True)
+                    yield x
+                print(flush=True)
+            it = it()
 
-    print(f"[IsaacSim] Verify done: {len(to_verify) - n_invalid} ok (skip), {n_invalid} deleted (re-render), {len(pending)} to render", flush=True)
+        for clip_id, out_path in it:
+            try:
+                import imageio
+                r = imageio.get_reader(out_path)
+                try:
+                    r.get_data(0)
+                finally:
+                    r.close()
+                skip_ok.add(clip_id)
+            except Exception:
+                try:
+                    os.remove(out_path)
+                except OSError:
+                    pass
+        print(f"[IsaacSim] Verify done: {len(skip_ok)} ok (skip), {len(to_verify) - len(skip_ok)} deleted", flush=True)
+    else:
+        skip_ok = {cid for cid, _ in to_verify}
+
+    pending = [clip_id_to_dir[cid] for cid in clip_id_to_dir if cid not in skip_ok]
+    print(f"[IsaacSim] {len(pending)} to render", flush=True)
     return pending
 
 
