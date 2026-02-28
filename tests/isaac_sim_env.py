@@ -1,7 +1,7 @@
 """Isaac Sim environment for loading and visualizing the Aloha URDF robot.
 
-Multiprocessing mode: N workers, each initializes SimulationApp once and processes
-assigned clips sequentially. Videos saved to output_dir/video/.
+Multiprocessing mode: N workers, clip queue - worker pulls next clip when done.
+Videos saved to output_dir/video/.
 
     python tests/isaac_sim_env.py --input-dir outputs/ik/data --output-dir outputs/render --headless --num-workers 2
 """
@@ -12,6 +12,7 @@ import argparse
 import json
 import multiprocessing
 import os
+import queue
 import sys
 import time
 import xml.etree.ElementTree as ET
@@ -841,9 +842,13 @@ def _render_single_clip(env: IsaacSimEnv, data_dir: str, opts: argparse.Namespac
     return None
 
 
-def _worker_process_clips(task: tuple) -> list[dict]:
-    """Worker: init SimulationApp once, process assigned clips. Run in separate process."""
-    worker_id, clip_dirs, opts_dict = task
+def _queue_worker(
+    worker_id: int,
+    task_queue: multiprocessing.Queue,
+    result_queue: multiprocessing.Queue,
+    opts_dict: dict,
+) -> None:
+    """Worker: init SimulationApp once, pull clips from queue until empty."""
     tag = f"[IsaacSim Worker{worker_id}]"
 
     # Serial startup: stagger Isaac Sim init to avoid URDF temp file conflicts
@@ -860,26 +865,29 @@ def _worker_process_clips(task: tuple) -> list[dict]:
             setattr(args, key, val)
 
     env = IsaacSimEnv(args)
-    results = []
-    for i, data_dir in enumerate(clip_dirs):
+    done_count = 0
+    while True:
+        data_dir = task_queue.get()
+        if data_dir is None:
+            break
         clip_name = os.path.basename(data_dir.rstrip("/"))
-        print(f"{tag} [{i+1}/{len(clip_dirs)}] {clip_name}", flush=True)
+        done_count += 1
+        print(f"{tag} [{done_count}] {clip_name}", flush=True)
         try:
             stats = _render_single_clip(env, data_dir, opts_dict)
             if stats is not None:
-                results.append(stats)
+                result_queue.put(stats)
                 print(f"  Saved, FPS: {stats['render_fps']:.1f}", flush=True)
             else:
-                results.append({"clip_id": clip_name, "error": "render failed"})
+                result_queue.put({"clip_id": clip_name, "error": "render failed"})
         except Exception as e:
-            results.append({"clip_id": clip_name, "error": str(e)})
+            result_queue.put({"clip_id": clip_name, "error": str(e)})
             print(f"  Error: {e}", flush=True)
     env.close()
-    return results
 
 
 def _run_multiprocessing_batch(args: argparse.Namespace, clip_dirs: list[str]) -> None:
-    """Multiprocessing batch: distribute clips across workers."""
+    """Multiprocessing batch: clip queue, workers pull when ready."""
     num_workers = max(1, getattr(args, "num_workers", 1))
     if num_workers <= 1 or len(clip_dirs) <= 1:
         num_workers = 1
@@ -903,24 +911,41 @@ def _run_multiprocessing_batch(args: argparse.Namespace, clip_dirs: list[str]) -
         "startup_delay": getattr(args, "startup_delay", 0),
     }
 
-    worker_clips: list[list[str]] = [[] for _ in range(num_workers)]
-    for i, cd in enumerate(clip_dirs):
-        worker_clips[i % num_workers].append(cd)
-    tasks = [(w, clips, opts_dict) for w, clips in enumerate(worker_clips) if clips]
+    task_queue = multiprocessing.Queue()
+    result_queue = multiprocessing.Queue()
+    for data_dir in clip_dirs:
+        task_queue.put(data_dir)
+    for _ in range(num_workers):
+        task_queue.put(None)  # sentinel per worker
 
     startup_delay = getattr(args, "startup_delay", 0)
-    print(f"[IsaacSim] Multiprocessing: {len(clip_dirs)} clips, {len(tasks)} workers", flush=True)
+    print(f"[IsaacSim] Queue mode: {len(clip_dirs)} clips, {num_workers} workers", flush=True)
     if startup_delay > 0:
         print(f"  Serial startup: {startup_delay}s delay between workers", flush=True)
-    for w, clips, _ in tasks:
-        print(f"  Worker {w}: {len(clips)} clips", flush=True)
 
     t_start = time.time()
-    with multiprocessing.Pool(processes=len(tasks)) as pool:
-        worker_results = pool.map(_worker_process_clips, tasks)
-    t_elapsed = time.time() - t_start
+    workers = []
+    for w in range(num_workers):
+        p = multiprocessing.Process(
+            target=_queue_worker,
+            args=(w, task_queue, result_queue, opts_dict),
+        )
+        p.start()
+        workers.append(p)
 
-    all_results = [r for results in worker_results for r in results]
+    all_results = []
+    result_timeout = 300
+    while len(all_results) < len(clip_dirs):
+        try:
+            r = result_queue.get(timeout=result_timeout)
+            all_results.append(r)
+        except queue.Empty:
+            if not any(p.is_alive() for p in workers):
+                print(f"[IsaacSim] Warning: all workers ended, only {len(all_results)}/{len(clip_dirs)} results", flush=True)
+                break
+    for p in workers:
+        p.join(timeout=10)
+    t_elapsed = time.time() - t_start
     total_frames = sum(r.get("n_frames", 0) for r in all_results if "error" not in r)
     parallel_fps = total_frames / t_elapsed if t_elapsed > 0 else 0.0
 
