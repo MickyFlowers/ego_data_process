@@ -7,6 +7,5 @@ imageio-ffmpeg
 torch
 torchvision
 scipy
-chumpy
 matplotlib
 ray
