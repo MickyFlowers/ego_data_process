@@ -663,7 +663,6 @@ def _filter_pending_clips(clip_dirs: list[str], output_dir: str, verify_video: b
     if to_verify and verify_video:
         print(f"[IsaacSim] Verifying {len(to_verify)} videos in {video_dir}", flush=True)
         try:
-            from tqdm import tqdm
             it = tqdm(to_verify, desc="Verify videos", unit="clip", file=sys.stdout)
         except ImportError:
             n_total = len(to_verify)
