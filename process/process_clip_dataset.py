@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 from pathlib import Path
 
 
@@ -7,9 +8,10 @@ def main(args):
     num_parts = args.num_parts
     input_dir = args.input_dir
     output_dir = args.output_dir
-    
 
-    all_clips = [p for p in Path(input_dir).glob("*") if p.is_dir()]
+    # os.scandir is faster than glob for large directories (single getdents vs many stats)
+    with os.scandir(input_dir) as it:
+        all_clips = sorted([Path(p.path) for p in it if p.is_dir()])
     num_clips = len(all_clips)
 
     # 将 all_clips 均分为 num_parts 部分
