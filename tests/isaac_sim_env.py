@@ -1,9 +1,10 @@
 """Isaac Sim environment for loading and visualizing the Aloha URDF robot.
 
 Multiprocessing mode: N workers, clip queue - worker pulls next clip when done.
-Videos saved to output_dir/video/.
+Videos saved to output_dir/video/ (or output_dir/part{i}/video/ when using --clip-parts).
 
     python tests/isaac_sim_env.py --input-dir outputs/ik/data --output-dir outputs/render --headless --num-workers 2
+    python tests/isaac_sim_env.py --clip-parts outputs/clip_parts.json --part 0 --output-dir outputs/render --headless --num-workers 2
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import multiprocessing
 import os
 import queue
 import sys
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 
@@ -80,6 +82,12 @@ class IsaacSimEnv:
             "headless": headless,
             "width": args.width,
             "height": args.height,
+            "extra_args": [
+                "--/log/level=error",
+                "--/log/fileLogLevel=error",
+                "--/log/outputStreamLevel=error",
+                # "--/exts/carb.crashreporter-breakpad/enabled=false",
+            ],
         }
         if headless:
             app_config["windowless"] = True
@@ -602,19 +610,9 @@ class IsaacSimEnv:
 
 # ----------------------------------------------------------------------
 def _resolve_clip_root(input_dir: str) -> str:
-    """Resolve input_dir to the directory that directly contains clip subdirs.
-
-    - If input_dir is IK output root (e.g. outputs/ik), clips are in input_dir/data.
-    - If input_dir already contains clip subdirs (e.g. outputs/ik/data), use as is.
-    """
+    """Return the dir that directly contains clip subdirs (folder name = clip_id)."""
     if not os.path.isdir(input_dir):
         return input_dir
-    # Check if this dir has clip subdirs (any subdir with meta.json)
-    for name in os.listdir(input_dir):
-        path = os.path.join(input_dir, name)
-        if os.path.isdir(path) and os.path.isfile(os.path.join(path, "meta.json")):
-            return input_dir  # Already has clips
-    # No clips here; try input_dir/data (IK output layout)
     data_sub = os.path.join(input_dir, "data")
     if os.path.isdir(data_sub):
         return data_sub
@@ -622,20 +620,12 @@ def _resolve_clip_root(input_dir: str) -> str:
 
 
 def _gather_clip_dirs(input_dir: str) -> list[str]:
-    """Return sorted list of valid clip directories (each has meta.json + joint_trajectory.json)."""
+    """Listdir once: each subfolder is a clip. Json read happens inside _render_single_clip."""
     root = _resolve_clip_root(input_dir)
     if not os.path.isdir(root):
         return []
-    out = []
-    for name in sorted(os.listdir(root)):
-        path = os.path.join(root, name)
-        if not os.path.isdir(path):
-            continue
-        if os.path.isfile(os.path.join(path, "meta.json")) and os.path.isfile(
-            os.path.join(path, "joint_trajectory.json")
-        ):
-            out.append(os.path.abspath(path))
-    return out
+    names = sorted(os.listdir(root))
+    return [os.path.abspath(os.path.join(root, n)) for n in names if os.path.isdir(os.path.join(root, n))]
 
 
 def _render_single_clip(env: IsaacSimEnv, data_dir: str, opts: argparse.Namespace | dict) -> dict | None:
@@ -751,6 +741,14 @@ def _render_single_clip(env: IsaacSimEnv, data_dir: str, opts: argparse.Namespac
         except ImportError:
             writer = None
 
+    # Prime render pipeline: set first frame pose and step to flush previous clip's state
+    if n_frames > 0:
+        left_q0 = np.array(left_traj[0], dtype=np.float64)
+        right_q0 = np.array(right_traj[0], dtype=np.float64)
+        env.set_joint(left_q0, right_q0)
+        for _ in range(2):
+            env.step(render=do_render)
+
     t_start = time.time()
     for frame_idx in range(n_frames):
         if not env.is_running():
@@ -851,12 +849,11 @@ def _queue_worker(
     """Worker: init SimulationApp once, pull clips from queue until empty."""
     tag = f"[IsaacSim Worker{worker_id}]"
 
-    # Serial startup: stagger Isaac Sim init to avoid URDF temp file conflicts
-    startup_delay = opts_dict.get("startup_delay", 0)
-    if startup_delay > 0 and worker_id > 0:
-        delay_sec = worker_id * startup_delay
-        print(f"{tag} waiting {delay_sec}s before startup (serial init)", flush=True)
-        time.sleep(delay_sec)
+    # Set per-worker temp dir to avoid URDF import conflicts (link1.tmp.usd etc)
+    worker_tmp = tempfile.mkdtemp(prefix=f"isaac_worker_{worker_id}_")
+    os.environ["TMPDIR"] = worker_tmp
+    os.environ["TEMP"] = worker_tmp
+    os.environ["TMP"] = worker_tmp
 
     parser = build_parser()
     args = parser.parse_args([])
@@ -908,7 +905,6 @@ def _run_multiprocessing_batch(args: argparse.Namespace, clip_dirs: list[str]) -
         "width": args.width,
         "height": args.height,
         "no_dae_materials": getattr(args, "no_dae_materials", False),
-        "startup_delay": getattr(args, "startup_delay", 0),
     }
 
     task_queue = multiprocessing.Queue()
@@ -918,11 +914,7 @@ def _run_multiprocessing_batch(args: argparse.Namespace, clip_dirs: list[str]) -
     for _ in range(num_workers):
         task_queue.put(None)  # sentinel per worker
 
-    startup_delay = getattr(args, "startup_delay", 0)
     print(f"[IsaacSim] Queue mode: {len(clip_dirs)} clips, {num_workers} workers", flush=True)
-    if startup_delay > 0:
-        print(f"  Serial startup: {startup_delay}s delay between workers", flush=True)
-
     t_start = time.time()
     workers = []
     for w in range(num_workers):
@@ -990,31 +982,53 @@ if __name__ == "__main__":
         help="Number of parallel workers (multiprocessing). Default 1 = single process.",
     )
     parser.add_argument(
-        "--startup-delay",
-        type=float,
-        default=15.0,
-        help="Seconds to wait between worker startups (serial init, avoids URDF temp file conflicts). Default 45.",
+        "--clip-parts",
+        type=str,
+        default=None,
+        help="Path to clip_parts.json from process_clip_dataset. When set, --part is required and clips are loaded from the specified part.",
+    )
+    parser.add_argument(
+        "--part",
+        type=int,
+        default=None,
+        help="Part index (0-based) when using --clip-parts. Output saved to output_dir/part{i}.",
     )
     args = parser.parse_args()
 
     # Determine clip directories
     clip_dirs: list[str] = []
-    if args.data_dir and os.path.isdir(args.data_dir):
-        meta_path = os.path.join(args.data_dir, "meta.json")
-        if os.path.isfile(meta_path):
+    if args.clip_parts and os.path.isfile(args.clip_parts):
+        # Load from process_clip_dataset result
+        with open(args.clip_parts) as f:
+            clip_parts = json.load(f)
+        part_idx = args.part
+        if part_idx is None:
+            raise ValueError("--part is required when --clip-parts is set")
+        if part_idx < 0 or part_idx >= len(clip_parts):
+            raise ValueError(
+                f"--part must be in [0, {len(clip_parts) - 1}], got {part_idx}"
+            )
+        clip_dirs = [os.path.abspath(p) for p in clip_parts[part_idx]]
+        if not clip_dirs:
+            raise ValueError(f"Part {part_idx} has no clips")
+        output_dir = getattr(args, "output_dir", None)
+        if not output_dir:
+            raise ValueError("--output-dir is required when --clip-parts is set")
+        args.output_dir = os.path.join(output_dir, f"part{part_idx}")
+        print(f"[IsaacSimEnv] Part mode: {len(clip_dirs)} clips from part {part_idx} -> {args.output_dir}", flush=True)
+    elif args.data_dir and os.path.isdir(args.data_dir):
+        clip_dirs = _gather_clip_dirs(args.data_dir)
+        if len(clip_dirs) == 0:
             clip_dirs = [os.path.abspath(args.data_dir)]
-        else:
-            # data_dir might be IK root (outputs/ik) or data parent (outputs/ik/data)
-            clip_dirs = _gather_clip_dirs(args.data_dir)
-            if clip_dirs:
-                print(f"[IsaacSimEnv] Resolved --data-dir to {len(clip_dirs)} clips")
+        elif len(clip_dirs) > 1:
+            print(f"[IsaacSimEnv] Resolved --data-dir to {len(clip_dirs)} clips")
     elif args.input_dir and os.path.isdir(args.input_dir):
         clip_dirs = _gather_clip_dirs(args.input_dir)
     else:
         ik_root = os.path.join(os.path.dirname(__file__), "..", "outputs", "ik")
         clip_dirs = _gather_clip_dirs(ik_root)
         if not clip_dirs:
-            raise FileNotFoundError(f"No clip directories in {ik_root} or {os.path.join(ik_root, 'data')}")
+            raise FileNotFoundError(f"No clip directories in {ik_root}")
         if not args.input_dir and not args.data_dir:
             clip_dirs = [clip_dirs[0]]
             print(f"[IsaacSimEnv] Auto-selected single clip: {os.path.basename(clip_dirs[0])}")
