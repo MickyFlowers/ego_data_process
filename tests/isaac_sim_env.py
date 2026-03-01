@@ -695,6 +695,9 @@ def _filter_pending_clips(clip_dirs: list[str], output_dir: str, verify_video: b
         print(f"[IsaacSim] Verify done: {len(skip_ok)} ok (skip), {len(to_verify) - len(skip_ok)} deleted", flush=True)
     else:
         skip_ok = {cid for cid, _ in to_verify}
+        if skip_ok:
+            print(f"[IsaacSim] Skipping {len(skip_ok)} clips (already have mp4)", flush=True)
+            time.sleep(5)
 
     pending = [clip_id_to_dir[cid] for cid in clip_id_to_dir if cid not in skip_ok]
     print(f"[IsaacSim] {len(pending)} to render", flush=True)
