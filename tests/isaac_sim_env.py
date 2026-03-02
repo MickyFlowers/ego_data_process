@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 import xml.etree.ElementTree as ET
-
+import copy
 import numpy as np
 
 
@@ -408,19 +408,19 @@ class IsaacSimEnv:
             back[0], back[1], back[2],
         )
         # Gf.Rotation does not take Matrix3d; build from axis-angle (Vec3d, double)
-        trace_r = rot[0][0] + rot[1][1] + rot[2][2]
-        angle = np.arccos(np.clip((trace_r - 1.0) / 2.0, -1.0, 1.0))
-        sin_a = np.sin(angle)
-        if sin_a > 1e-8:
-            ax = (rot[1][2] - rot[2][1]) / (2 * sin_a)
-            ay = (rot[2][0] - rot[0][2]) / (2 * sin_a)
-            az = (rot[0][1] - rot[1][0]) / (2 * sin_a)
-            axis = Gf.Vec3d(ax, ay, az)
-        else:
-            axis = Gf.Vec3d(1, 0, 0)
-        rot_mat = Gf.Matrix4d()
-        rot_mat.SetRotateOnly(Gf.Rotation(axis, angle))
-        rot_mat.SetTranslateOnly(Gf.Vec3d(*eye.tolist()))
+        # trace_r = rot[0][0] + rot[1][1] + rot[2][2]
+        # angle = np.arccos(np.clip((trace_r - 1.0) / 2.0, -1.0, 1.0))
+        # sin_a = np.sin(angle)
+        # if sin_a > 1e-8:
+        #     ax = (rot[1][2] - rot[2][1]) / (2 * sin_a)
+        #     ay = (rot[2][0] - rot[0][2]) / (2 * sin_a)
+        #     az = (rot[0][1] - rot[1][0]) / (2 * sin_a)
+        #     axis = Gf.Vec3d(ax, ay, az)
+        # else:
+        #     axis = Gf.Vec3d(1, 0, 0)
+        rot_mat = Gf.Matrix4d(rot, Gf.Vec3d(*eye.tolist()))
+        # rot_mat.SetRotateOnly(Gf.Rotation(axis, angle))
+        # rot_mat.SetTranslateOnly(Gf.Vec3d(*eye.tolist()))
 
         cam_prim = stage.GetPrimAtPath(cam_path)
         if cam_prim.IsValid():
@@ -917,7 +917,7 @@ def _render_single_clip(env: IsaacSimEnv, data_dir: str, opts: argparse.Namespac
     K = np.array(meta.get("camera_intrinsics", [[512, 0, 256], [0, 512, 256], [0, 0, 1]]), dtype=np.float64)
     scale_x = render_w / img_w
     scale_y = render_h / img_h
-    K_scaled = K.copy()
+    K_scaled = copy.deepcopy(K)
     K_scaled[0, 0] *= scale_x
     K_scaled[1, 1] *= scale_y
     K_scaled[0, 2] *= scale_x
@@ -943,8 +943,12 @@ def _render_single_clip(env: IsaacSimEnv, data_dir: str, opts: argparse.Namespac
         # assert K_scaled[0, 0] == K_scaled[1, 1], f"fx: {K_scaled[0, 0]} != fy: {K_scaled[1, 1]}, original: fx: {fx},fy: {fy}, render_w_actual: {render_w_actual}, render_h_actual: {render_h_actual}, render_w: {render_w}, render_h: {render_h}"
         needs_resize = render_w_actual != render_w or render_h_actual != render_h
         # libx264 需偶數
-        
-        
+    # dewbug
+    # render_h = img_h
+    # render_w = img_w
+    # render_h_actual = img_h
+    # render_w_actual = img_w
+    # K_scaled = copy.deepcopy(K)
     # 按需创建/更新 render product 使分辨率为 (render_w, render_h_actual)
     if not env._ensure_render_product(render_w_actual, render_h_actual):
         return None

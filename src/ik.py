@@ -1376,9 +1376,9 @@ def process_single_clip(
     return stats
 
 def main() -> None:
-    json_path = os.path.abspath("outputs/epfl_retarget/data/YH2002_2023_12_04_10_15_23__11585_12023_439.json")
+    json_path = os.path.abspath("/home/cyx/projects/test_ik/outputs/test/data/0462419d-c275-448a-a275-218cf25cca21__10013_10204_192.json")
     urdf = os.path.abspath("assets/aloha_new_description/urdf/dual_piper.urdf")
-    process_single_clip(json_path, output_dir="outputs/epfl_ik", do_render=False, use_gui=True, urdf_path=urdf)
+    process_single_clip(json_path, output_dir="outputs/epfl_ik", do_render=True, use_gui=True, urdf_path=urdf)
 
 if __name__ == "__main__":
     main()
