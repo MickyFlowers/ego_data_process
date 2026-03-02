@@ -25,8 +25,25 @@ EARLY_OUT_DIST = 0.5
 REPLAY_FPS = 60
 IK_JUMP_THRESHOLD = 0.5  # rad per frame — max joint velocity ≈ 15 rad/s @30fps
 KF_EDGE_PAD = 15  # frames to replicate at edges before KF smoothing (absorbs RTS boundary effect)
-# Validation render: low res, no shadows, for speed
-RENDER_RESOLUTION = [640, 480]
+# Short side for output scaling (等比例短边)
+SHORT_SIDE = 512
+
+
+def short_side_resolution(img_w: int, img_h: int, short_side: int = SHORT_SIDE) -> list[int]:
+    """Scale so the SHORT edge (min of w,h) becomes short_side. E.g. 1920×1080 -> [910, 512], NOT [512, 288].
+    Output dimensions are aligned to even (divisible by 2) for libx264 yuv420p compatibility."""
+    if short_side <= 0:
+        return [img_w, img_h]
+    s = short_side / max(1, min(img_w, img_h))
+    w = max(64, int(round(img_w * s)))
+    h = max(64, int(round(img_h * s)))
+    w = w - (w % 2)
+    h = h - (h % 2)
+    return [w, h]
+
+
+# Validation render: low res, no shadows, for speed (fallback when img_size unknown)
+RENDER_RESOLUTION = [512, 512]
 
 LEFT_JOINT_NAMES = (
     "left_joint1", "left_joint2", "left_joint3",
@@ -992,11 +1009,13 @@ def render_and_overlay(
     original_video_path: str,
     output_path: str,
     fps: float,
+    mask_path: str | None = None,
     verbose: bool = True,
 ) -> None:
     """
     Single-pass streaming: render robot per frame -> seg mask -> overlay onto original video -> write.
     No intermediate frame storage, low memory.
+    If mask_path is provided, also saves robot silhouette (simulation before overlay) to mask_path.
     """
     import imageio
     from PIL import Image
@@ -1015,7 +1034,14 @@ def render_and_overlay(
 
     reader = imageio.get_reader(original_video_path)
     os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
-    writer = imageio.get_writer(output_path, fps=fps)
+    tmp_output = output_path.replace(".mp4", ".tmp.mp4")
+    writer = imageio.get_writer(tmp_output, fps=fps, codec="libx264", macro_block_size=1)
+
+    mask_writer = None
+    if mask_path:
+        os.makedirs(os.path.dirname(os.path.abspath(mask_path)) or ".", exist_ok=True)
+        tmp_mask = mask_path.replace(".mp4", ".tmp.mp4")
+        mask_writer = imageio.get_writer(tmp_mask, fps=fps, codec="libx264", macro_block_size=1)
 
     need_resize = None  # Decided on first frame
     if verbose:
@@ -1059,6 +1085,16 @@ def render_and_overlay(
             robot_rgb = np.asarray(Image.fromarray(robot_rgb).resize((bg_w, bg_h), Image.BILINEAR))
             mask = np.asarray(Image.fromarray(mask.astype(np.uint8) * 255).resize((bg_w, bg_h), Image.NEAREST)) > 127
 
+        # --- Mask frame (simulation before overlay): robot silhouette for mask/{clip_id}.mp4 ---
+        mask_frame = np.stack([mask.astype(np.uint8) * 255] * 3, axis=-1)
+        if mask_writer is not None:
+            out_w, out_h = int(render_size[0]), int(render_size[1])
+            if mask_frame.shape[:2] != (out_h, out_w):
+                mask_frame = np.asarray(
+                    Image.fromarray(mask_frame).resize((out_w, out_h), Image.NEAREST)
+                )
+            mask_writer.append_data(mask_frame[:, :, :3])
+
         # --- Overlay then resize to render_size so saved video uses this resolution ---
         bg[mask] = robot_rgb[mask]
         out_w, out_h = int(render_size[0]), int(render_size[1])
@@ -1071,6 +1107,13 @@ def render_and_overlay(
 
     reader.close()
     writer.close()
+    if os.path.isfile(tmp_output):
+        os.rename(tmp_output, output_path)
+    if mask_writer is not None:
+        mask_writer.close()
+        tmp_mask = mask_path.replace(".mp4", ".tmp.mp4")
+        if os.path.isfile(tmp_mask):
+            os.rename(tmp_mask, mask_path)
     if verbose:
         print(f"[Render+Overlay] Done: {output_path} ({n_frames} frames, {fps} FPS)")
 
@@ -1186,12 +1229,11 @@ def process_single_clip(
     Output files:
         {output_dir}/data/{clip_id}/joint_trajectory.json
         {output_dir}/data/{clip_id}/stats.json
-        {output_dir}/samples/{clip_id}.mp4  (only when do_render=True)
+        {output_dir}/samples/video/{clip_id}.mp4  (only when do_render=True)
+        {output_dir}/samples/mask/{clip_id}.mp4    (only when do_render=True)
 
     Returns: stats dict (same as stats.json content).
     """
-    if render_resolution is None:
-        render_resolution = RENDER_RESOLUTION
     clip_id = os.path.splitext(os.path.basename(json_path))[0]
 
     # --- Load data ---
@@ -1203,6 +1245,9 @@ def process_single_clip(
         json_path, use_ekf=True, use_gripper_kf=True,
         camera_elevation_deg=camera_elevation_deg,
     )
+
+    if render_resolution is None:
+        render_resolution = short_side_resolution(img_size[0], img_size[1])
 
     n_frames = min(
         left_pose_matrix.shape[0], right_pose_matrix.shape[0],
@@ -1305,14 +1350,18 @@ def process_single_clip(
     if do_render:
         if video_path and os.path.isfile(video_path):
             render_K = scale_intrinsics(camera_intrinsics, img_size, render_resolution)
-            sample_dir = os.path.join(output_dir, "samples")
-            os.makedirs(sample_dir, exist_ok=True)
-            overlay_path = os.path.join(sample_dir, f"{clip_id}.mp4")
+            video_dir = os.path.join(output_dir, "samples", "video")
+            mask_dir = os.path.join(output_dir, "samples", "mask")
+            os.makedirs(video_dir, exist_ok=True)
+            os.makedirs(mask_dir, exist_ok=True)
+            overlay_path = os.path.join(video_dir, f"{clip_id}.mp4")
+            mask_path = os.path.join(mask_dir, f"{clip_id}.mp4")
             render_and_overlay(
                 robot_info, left_joint_traj, right_joint_traj,
                 left_gripper, right_gripper,
                 camera_matrix, render_K, render_resolution,
                 video_path, overlay_path, fps,
+                mask_path=mask_path,
                 verbose=verbose,
             )
         else:

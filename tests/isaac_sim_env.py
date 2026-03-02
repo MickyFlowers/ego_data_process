@@ -144,7 +144,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--video-path", type=str, default=None, help="Override source video path for overlay (default: from meta.json)")
     parser.add_argument("--render-width", type=int, default=512)
     parser.add_argument("--render-height", type=int, default=512)
-    parser.add_argument("--render-size", type=int, default=512, help="Square resolution for render (default: 512x512)")
+    parser.add_argument("--render-size", type=int, default=None, help="Square resolution for render (overrides short-side)")
+    parser.add_argument("--short-side", type=int, default=512, help="Scale output so short edge = N (default: 512)")
     parser.add_argument("--render-scale", type=float, default=1.0, help="Scale resolution for speed (e.g. 0.5 = half res)")
     parser.add_argument("--render-warmup", type=int, default=5, help="Warmup renders before first frame to avoid artifacts (default: 5)")
     parser.add_argument(
@@ -329,30 +330,63 @@ class IsaacSimEnv:
 
     # ------------------------------------------------------------------
     def _setup_replicator_render(self, args: argparse.Namespace) -> None:
-        """Create render product from viewport camera with instance segmentation (seg only for speed)."""
+        """Setup Replicator render settings. Render product is created lazily in _ensure_render_product."""
         try:
             import omni.replicator.core as rep
-
-            scale = getattr(args, "render_scale", 1.0)
-            rw = int(getattr(args, "render_width", 512) * scale)
-            rh = int(getattr(args, "render_height", 512) * scale)
-            rw, rh = max(64, rw), max(64, rh)
-            cam_path = "/OmniverseKit_Persp"
 
             if hasattr(rep.settings, "set_render_rasterized"):
                 rep.settings.set_render_rasterized()
                 print("[IsaacSimEnv] Set render rasterized")
             elif hasattr(rep.settings, "set_render_rtx_realtime"):
                 rep.settings.set_render_rtx_realtime()
+        except Exception as e:
+            print(f"[IsaacSimEnv] Replicator setup failed: {e}")
 
+    def _ensure_render_product(self, rw: int, rh: int) -> bool:
+        """Create or recreate render product if resolution differs. Returns True if ready to render."""
+        try:
+            import omni.replicator.core as rep
+
+            rw, rh = max(64, rw), max(64, rh)
+            current = getattr(self, "_render_product_resolution", None)
+            if current == (rw, rh) and self._render_product is not None:
+                return True
+
+            if self._render_product is not None:
+                try:
+                    if hasattr(self._rgb_annotator, "detach") and self._rgb_annotator is not None:
+                        self._rgb_annotator.detach()
+                    if hasattr(self._seg_annotator, "detach") and self._seg_annotator is not None:
+                        self._seg_annotator.detach()
+                except Exception:
+                    pass
+                try:
+                    if hasattr(self._render_product, "destroy"):
+                        self._render_product.destroy()
+                except Exception:
+                    pass
+                self._render_product = None
+                # 重建后需清除 Camera intrinsics 缓存，否则会指向已销毁的 render product
+                if self._intrinsics_cam is not None:
+                    try:
+                        self._intrinsics_cam.destroy()
+                    except Exception:
+                        pass
+                    self._intrinsics_cam = None
+                    self._intrinsics_cam_resolution = None
+
+            cam_path = "/OmniverseKit_Persp"
             self._render_product = rep.create.render_product(cam_path, (rw, rh))
+            self._render_product_resolution = (rw, rh)
             self._rgb_annotator = rep.AnnotatorRegistry.get_annotator("rgb")
             self._rgb_annotator.attach(self._render_product)
             self._seg_annotator = rep.AnnotatorRegistry.get_annotator("instance_segmentation_fast")
             self._seg_annotator.attach(self._render_product)
             print(f"[IsaacSimEnv] Replicator render {rw}x{rh} (rgb + seg)")
+            return True
         except Exception as e:
-            print(f"[IsaacSimEnv] Replicator setup failed: {e}")
+            print(f"[IsaacSimEnv] _ensure_render_product failed: {e}")
+            return False
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -734,64 +768,100 @@ def _filter_pending_clips(clip_dirs: list[str], output_dir: str, verify_video: b
     """Return clips that still need rendering.
 
     Logic: skip only when BOTH mask and video exist for clip_id. If only one exists,
-    delete the orphan and do not skip.
+    delete the orphan and do NOT remove from clip list (will be re-rendered).
     """
     if not output_dir:
         return clip_dirs
     video_dir = os.path.abspath(os.path.join(output_dir, "video"))
+    mask_dir = os.path.abspath(os.path.join(output_dir, "mask"))
     print(f"[IsaacSim] Output video dir: {video_dir}", flush=True)
+    print(f"[IsaacSim] Output mask dir: {mask_dir}", flush=True)
 
-    # Remove stale .tmp.mp4 from previous interrupted runs
-    if os.path.isdir(video_dir):
-        removed = 0
-        for f in os.listdir(video_dir):
-            if f.endswith(".tmp.mp4"):
-                try:
-                    os.remove(os.path.join(video_dir, f))
-                    removed += 1
-                except OSError:
-                    pass
-        if removed:
-            print(f"[IsaacSim] Removed {removed} stale .tmp.mp4", flush=True)
+    # Remove stale .tmp.mp4 from previous interrupted runs (video and mask)
+    for d in (video_dir, mask_dir):
+        if os.path.isdir(d):
+            removed = 0
+            for f in os.listdir(d):
+                if f.endswith(".tmp.mp4"):
+                    try:
+                        os.remove(os.path.join(d, f))
+                        removed += 1
+                    except OSError:
+                        pass
+            if removed:
+                print(f"[IsaacSim] Removed {removed} stale .tmp.mp4 from {os.path.basename(d)}", flush=True)
 
     clip_id_to_dir = {os.path.basename(d.rstrip("/")): d for d in clip_dirs}
 
     video_has = {}  # clip_id -> path
+    mask_has = {}  # clip_id -> path
     if os.path.isdir(video_dir):
         for f in os.listdir(video_dir):
             if f.endswith(".mp4") and not f.endswith(".tmp.mp4"):
                 cid = f[:-4]
                 if cid in clip_id_to_dir:
                     video_has[cid] = os.path.join(video_dir, f)
+    if os.path.isdir(mask_dir):
+        for f in os.listdir(mask_dir):
+            if f.endswith(".mp4") and not f.endswith(".tmp.mp4"):
+                cid = f[:-4]
+                if cid in clip_id_to_dir:
+                    mask_has[cid] = os.path.join(mask_dir, f)
 
+    # Orphans: only video or only mask -> delete the orphan, do NOT skip (keep in pending)
+    for cid in set(video_has) | set(mask_has):
+        v = cid in video_has
+        m = cid in mask_has
+        if v and not m:
+            try:
+                os.remove(video_has[cid])
+                del video_has[cid]
+            except OSError:
+                pass
+        elif m and not v:
+            try:
+                os.remove(mask_has[cid])
+                del mask_has[cid]
+            except OSError:
+                pass
+
+    # Both exist -> skip (optionally verify first)
+    both_ids = set(video_has.keys()) & set(mask_has.keys())
     skip_ok = set()
-    if video_has and verify_video:
-        print(f"[IsaacSim] Verifying {len(video_has)} videos", flush=True)
-        n_total = len(video_has)
-        for i, cid in enumerate(sorted(video_has)):
+    if both_ids and verify_video:
+        print(f"[IsaacSim] Verifying {len(both_ids)} video+mask pairs", flush=True)
+        n_total = len(both_ids)
+        for i, cid in enumerate(sorted(both_ids)):
             if (i + 1) % 10 == 0 or i == 0 or i == n_total - 1:
                 print(f"\r[IsaacSim] Verify: {i + 1}/{n_total}", end="", flush=True)
             ok = True
-            path = video_has[cid]
-            try:
-                import imageio
-                r = imageio.get_reader(path)
+            for path in [video_has[cid], mask_has[cid]]:
                 try:
-                    r.get_data(0)
-                finally:
-                    r.close()
-            except Exception:
-                ok = False
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
+                    import imageio
+                    r = imageio.get_reader(path)
+                    try:
+                        r.get_data(0)
+                    finally:
+                        r.close()
+                except Exception:
+                    ok = False
+                    if cid in video_has:
+                        try:
+                            os.remove(video_has[cid])
+                        except OSError:
+                            pass
+                    if cid in mask_has:
+                        try:
+                            os.remove(mask_has[cid])
+                        except OSError:
+                            pass
+                    break
             if ok:
                 skip_ok.add(cid)
         print(f"[IsaacSim] Verify done: {len(skip_ok)} ok (skip)", flush=True)
-    elif video_has:
-        skip_ok = set(video_has.keys())
-        print(f"[IsaacSim] Skipping {len(skip_ok)} clips (have video)", flush=True)
+    elif both_ids:
+        skip_ok = both_ids
+        print(f"[IsaacSim] Skipping {len(skip_ok)} clips (have both video and mask)", flush=True)
 
     pending = [clip_id_to_dir[cid] for cid in clip_id_to_dir if cid not in skip_ok]
     print(f"[IsaacSim] {len(pending)} to render", flush=True)
@@ -826,15 +896,24 @@ def _render_single_clip(env: IsaacSimEnv, data_dir: str, opts: argparse.Namespac
     set_camera_view(eye=eye, target=target, camera_prim_path="/OmniverseKit_Persp")
     IsaacSimEnv._apply_camera_up(env.stage, "/OmniverseKit_Persp", eye, target, up)
 
-    # Scale intrinsics to render resolution (ego_overlay convention)
-    render_w = _get("render_width", 512)
-    render_h = _get("render_height", 512)
-    scale = _get("render_scale", 1.0)
-    if scale != 1.0:
-        render_w = int(render_w * scale)
-        render_h = int(render_h * scale)
+    # Render size: short-side scaling (等比例短边512) or from opts
     img_size = meta.get("img_size", [512, 512])
     img_w, img_h = max(1, img_size[0]), max(1, img_size[1])
+    short_side = _get("short_side", 512)
+    if short_side > 0:
+        s = short_side / min(img_w, img_h)
+        render_w = max(64, int(round(img_w * s)))
+        render_h = max(64, int(round(img_h * s)))
+        render_w = render_w - (render_w % 2)
+        render_h = render_h - (render_h % 2)
+    else:
+        render_w = _get("render_width", 512)
+        render_h = _get("render_height", 512)
+    scale = _get("render_scale", 1.0)
+    if scale != 1.0:
+        render_w = max(64, int(render_w * scale))
+        render_h = max(64, int(render_h * scale))
+
     K = np.array(meta.get("camera_intrinsics", [[512, 0, 256], [0, 512, 256], [0, 0, 1]]), dtype=np.float64)
     scale_x = render_w / img_w
     scale_y = render_h / img_h
@@ -848,22 +927,35 @@ def _render_single_clip(env: IsaacSimEnv, data_dir: str, opts: argparse.Namespac
     cx, cy = float(K_scaled[0, 2]), float(K_scaled[1, 2])
     # Omniverse 相機使用方像素，fx!=fy 時需渲染尺寸調整
     render_h_actual = render_h
+    render_w_actual = render_w
     needs_resize = False
     if abs(fx - fy) > 1e-3:
-        render_h_actual = max(1, int(round(render_h * fx / fy)))
-        K_scaled[1, 1] = fx
-        K_scaled[1, 2] = cy * render_h_actual / render_h
-        needs_resize = render_h_actual != render_h
+        if fx > fy:
+            render_h_actual = max(1, int(round(render_h * fx / fy)))
+            render_h_actual = render_h_actual - (render_h_actual % 2)
+            K_scaled[1, 1] = fy * float(render_h_actual) / float(render_h)
+            K_scaled[1, 2] = cy * float(render_h_actual) / float(render_h)
+        else:
+            render_w_actual = max(1, int(round(render_w * fy / fx)))
+            render_w_actual = render_w_actual - (render_w_actual % 2)
+            K_scaled[0, 0] = fx * float(render_w_actual) / float(render_w)
+            K_scaled[0, 2] = cx * float(render_w_actual) / float(render_w)
+        # assert K_scaled[0, 0] == K_scaled[1, 1], f"fx: {K_scaled[0, 0]} != fy: {K_scaled[1, 1]}, original: fx: {fx},fy: {fy}, render_w_actual: {render_w_actual}, render_h_actual: {render_h_actual}, render_w: {render_w}, render_h: {render_h}"
+        needs_resize = render_w_actual != render_w or render_h_actual != render_h
+        # libx264 需偶數
+        
+        
+    # 按需创建/更新 render product 使分辨率为 (render_w, render_h_actual)
+    if not env._ensure_render_product(render_w_actual, render_h_actual):
+        return None
 
     near_plane = float(meta.get("camera_near", 0.01))
     far_plane = float(meta.get("camera_far", 10.0))
-    rp_path = None
-    if env._render_product is not None:
-        rp_path = getattr(env._render_product, "path", env._render_product)
+    rp_path = getattr(env._render_product, "path", env._render_product)
     env._set_camera_intrinsics_opencv(
         "/OmniverseKit_Persp",
         K_scaled,
-        width=render_w,
+        width=render_w_actual,
         height=render_h_actual,
         near=near_plane,
         far=far_plane,
@@ -880,21 +972,18 @@ def _render_single_clip(env: IsaacSimEnv, data_dir: str, opts: argparse.Namespac
     do_overlay = False
     source_reader = None
     writer = None
+    mask_writer = None
     fps_meta = meta.get("fps", 30)
     clip_id = meta.get("clip_id", os.path.basename(data_dir.rstrip("/")))
     video_dir = os.path.join(output_dir, "video") if output_dir else None
+    mask_dir = os.path.join(output_dir, "mask") if output_dir else None
     output_video_path = os.path.join(video_dir, f"{clip_id}.mp4") if video_dir else None
-
-    render_w = _get("render_width", 512)
-    render_h = _get("render_height", 512)
-    scale = _get("render_scale", 1.0)
-    if scale != 1.0:
-        render_w = int(render_w * scale)
-        render_h = int(render_h * scale)
+    output_mask_path = os.path.join(mask_dir, f"{clip_id}.mp4") if mask_dir else None
 
     if do_render:
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(video_dir, exist_ok=True)
+        os.makedirs(mask_dir, exist_ok=True)
         video_path = _get("video_path") or meta.get("video_path")
         if not _get("no_overlay", False) and video_path and os.path.isfile(video_path):
             try:
@@ -908,9 +997,12 @@ def _render_single_clip(env: IsaacSimEnv, data_dir: str, opts: argparse.Namespac
             import imageio
 
             tmp_video = output_video_path.replace(".mp4", ".tmp.mp4")
+            tmp_mask = output_mask_path.replace(".mp4", ".tmp.mp4")
             writer = imageio.get_writer(tmp_video, fps=fps_meta, codec="libx264", macro_block_size=1)
+            mask_writer = imageio.get_writer(tmp_mask, fps=fps_meta, codec="libx264", macro_block_size=1)
         except ImportError:
             writer = None
+            mask_writer = None
 
     # Prime render pipeline: set first frame pose and step to flush previous clip's state
     if n_frames > 0:
@@ -941,7 +1033,7 @@ def _render_single_clip(env: IsaacSimEnv, data_dir: str, opts: argparse.Namespac
                 if rgb.size == 0:
                     continue
                 if rgb.ndim == 1:
-                    rgb = rgb.reshape(render_h_actual, render_w, 4)
+                    rgb = rgb.reshape(render_h_actual, render_w_actual, 4)
                 robot_rgb = np.asarray(rgb[:, :, :3], dtype=np.uint8)
                 mask = (seg > 0).astype(np.uint8)
                 if needs_resize and (robot_rgb.shape[0], robot_rgb.shape[1]) != (render_h, render_w):
@@ -963,6 +1055,11 @@ def _render_single_clip(env: IsaacSimEnv, data_dir: str, opts: argparse.Namespac
                     from PIL import Image
                 except ImportError:
                     Image = None
+
+                # Mask frame (simulation before overlay): robot silhouette for mask/{clip_id}.mp4
+                mask_frame = np.stack([mask.astype(np.uint8) * 255] * 3, axis=-1)
+                if mask_writer is not None:
+                    mask_writer.append_data(mask_frame[:, :, :3])
 
                 if do_overlay and source_reader is not None and Image is not None:
                     try:
@@ -1005,9 +1102,15 @@ def _render_single_clip(env: IsaacSimEnv, data_dir: str, opts: argparse.Namespac
 
     if writer is not None:
         writer.close()
-        tmp_path = output_video_path.replace(".mp4", ".tmp.mp4")
-        if os.path.isfile(tmp_path):
-            os.rename(tmp_path, output_video_path)
+        tmp_video = output_video_path.replace(".mp4", ".tmp.mp4")
+        if os.path.isfile(tmp_video):
+            os.rename(tmp_video, output_video_path)
+    if mask_writer is not None:
+        mask_writer.close()
+        tmp_mask = output_mask_path.replace(".mp4", ".tmp.mp4")
+        if os.path.isfile(tmp_mask):
+            os.rename(tmp_mask, output_mask_path)
+    if writer is not None:
         render_fps = n_frames / t_elapsed if t_elapsed > 0 else 0.0
         return {
             "clip_id": clip_id,
@@ -1084,7 +1187,7 @@ def _run_multiprocessing_batch(args: argparse.Namespace, clip_dirs: list[str]) -
         "render_height": getattr(args, "render_height", 512),
         "render_scale": getattr(args, "render_scale", 1.0),
         "render_warmup": getattr(args, "render_warmup", 5),
-        "render_size": getattr(args, "render_size", 512),
+        "short_side": getattr(args, "short_side", 512),
         "no_overlay": args.no_overlay,
         "video_path": getattr(args, "video_path", None),
         "urdf_path": urdf_path,
@@ -1233,17 +1336,29 @@ if __name__ == "__main__":
     if not clip_dirs:
         raise FileNotFoundError("No valid clip directories")
 
-    # Resolve render size from first clip
+    # Resolve render size from first clip (短边=short, 非宽=short. 1920×1080->910×512)
+    def _short_side_size(w: int, h: int, short: int) -> tuple[int, int]:
+        if short <= 0:
+            return w, h
+        s = short / min(w, h)  # 短边 min(w,h) 缩放到 short
+        rw = max(64, int(round(w * s)))
+        rh = max(64, int(round(h * s)))
+        rw, rh = rw - (rw % 2), rh - (rh % 2)  # libx264 yuv420p 需偶数
+        return rw, rh
+
     data_dir = clip_dirs[0]
     with open(os.path.join(data_dir, "meta.json")) as f:
         meta = json.load(f)
     img_size = meta.get("img_size", [512, 512])
+    iw, ih = max(1, img_size[0]), max(1, img_size[1])
     render_size = getattr(args, "render_size", None)
+    short_side = getattr(args, "short_side", 512)
     if render_size is not None and render_size > 0:
         args.render_width = args.render_height = render_size
+    elif short_side > 0:
+        args.render_width, args.render_height = _short_side_size(iw, ih, short_side)
     else:
-        args.render_width = img_size[0]
-        args.render_height = img_size[1]
+        args.render_width, args.render_height = iw, ih
 
     output_dir = getattr(args, "output_dir", None)
     num_workers = max(1, getattr(args, "num_workers", 1))
@@ -1306,4 +1421,4 @@ if __name__ == "__main__":
                 json.dump(summary, f, indent=2)
             print(f"[IsaacSim] Done: {summary['success']}/{summary['total']} ok, "
                   f"{total_frames} frames in {t_elapsed:.1f}s -> {summary_path}", flush=True)
-    env.close()
+        env.close()

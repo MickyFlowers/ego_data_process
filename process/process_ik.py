@@ -25,8 +25,12 @@ Output layout:
     │   │   └── stats.json
     │   └── ...
     └── samples/
-        ├── {sampled_clip_1}.mp4
-        └── ...
+        ├── video/
+        │   ├── {sampled_clip_1}.mp4
+        │   └── ...
+        └── mask/
+            ├── {sampled_clip_1}.mp4
+            └── ...
 
 Usage:
     python process_ik.py --input-dir outputs/data --output-dir outputs/ik_results --sample-ratio 0.05
@@ -146,7 +150,7 @@ def main():
     parser.add_argument("--num-cpus", type=int, default=None, help="Total CPUs for Ray (default: all)")
     parser.add_argument("--num-gpus", type=int, default=None, help="Total GPUs for Ray (default: all)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for sampling")
-    parser.add_argument("--render-resolution", type=list[int], default=[640, 480], help="Render resolution")
+    parser.add_argument("--render-resolution", type=list[int], default=[512, 512], help="Render resolution")
     parser.add_argument("--urdf-path", type=str, default="./assets/aloha_new_description/urdf/dual_piper.urdf", help="URDF path")
     parser.add_argument("--max-workers", type=int, default=None,
                         help="Max parallel workers (default: num_cpus, capped at 64)")
@@ -167,7 +171,24 @@ def main():
     print(f"[Batch] {n_total} clips -> {args.output_dir} (render {len(sample_indices)})")
 
     os.makedirs(os.path.join(args.output_dir, "data"), exist_ok=True)
-    os.makedirs(os.path.join(args.output_dir, "samples"), exist_ok=True)
+    video_dir = os.path.join(args.output_dir, "samples", "video")
+    mask_dir = os.path.join(args.output_dir, "samples", "mask")
+    os.makedirs(video_dir, exist_ok=True)
+    os.makedirs(mask_dir, exist_ok=True)
+
+    # Remove stale .tmp.mp4 from previous interrupted runs
+    for d in (video_dir, mask_dir):
+        if os.path.isdir(d):
+            removed = 0
+            for f in os.listdir(d):
+                if f.endswith(".tmp.mp4"):
+                    try:
+                        os.remove(os.path.join(d, f))
+                        removed += 1
+                    except OSError:
+                        pass
+            if removed:
+                print(f"[Batch] Removed {removed} stale .tmp.mp4 from {os.path.basename(d)}")
 
     ray_kwargs = {}
     if args.num_cpus is not None:

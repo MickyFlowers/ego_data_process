@@ -15,8 +15,21 @@ from manopth.manolayer import ManoLayer
 import h5py
 
 
-# Saved video resolution for both retarget replay and (when aligned) IK overlay; (width, height)
-SAVED_VIDEO_RESOLUTION = (640, 480)
+# Short side for output scaling (等比例短边)
+SHORT_SIDE = 512
+
+
+def short_side_resolution(img_w: int, img_h: int, short_side: int = SHORT_SIDE) -> Tuple[int, int]:
+    """Scale so the SHORT edge (min of w,h) becomes short_side. E.g. 1920×1080 -> 910×512, NOT 512×288.
+    Output dimensions are aligned to even (divisible by 2) for libx264 yuv420p compatibility."""
+    if short_side <= 0:
+        return img_w, img_h
+    s = short_side / max(1, min(img_w, img_h))
+    w = max(64, int(round(img_w * s)))
+    h = max(64, int(round(img_h * s)))
+    w = w - (w % 2)
+    h = h - (h % 2)
+    return w, h
 
 
 def scale_intrinsics(K: np.ndarray, src_size: list, dst_size: list) -> np.ndarray:
@@ -565,8 +578,9 @@ class HandRetargetPipeline:
         s0 = img_size[0].item() if hasattr(img_size[0], "item") else float(img_size[0])
         s1 = img_size[1].item() if hasattr(img_size[1], "item") else float(img_size[1])
         src_size = [int(round(s0)), int(round(s1))]
+        out_size = short_side_resolution(src_size[0], src_size[1])
         intrinsic_np = scale_intrinsics(
-            intrinsic.detach().cpu().numpy(), src_size, list(SAVED_VIDEO_RESOLUTION)
+            intrinsic.detach().cpu().numpy(), src_size, list(out_size)
         )
 
         left_cam_t = self.projector.world_to_camera(left_world, traj)
@@ -598,7 +612,7 @@ class HandRetargetPipeline:
             axes_uv_left,
             axes_uv_right,
             method_list,
-            SAVED_VIDEO_RESOLUTION,
+            out_size,
             draw_kps,
         )
     
@@ -697,12 +711,14 @@ class HandRetargetPipeline:
             video_path = Path(video_path)
 
         intrinsic_np = np.array(all_data["camera"]["intrinsic"], dtype=np.float32)
-        out_w, out_h = SAVED_VIDEO_RESOLUTION
         img_size = all_data.get("camera", {}).get("img_size")
         if img_size and len(img_size) >= 2:
+            out_w, out_h = short_side_resolution(int(img_size[0]), int(img_size[1]))
             intrinsic_np = scale_intrinsics(
                 intrinsic_np, [int(img_size[0]), int(img_size[1])], [out_w, out_h]
             )
+        else:
+            out_w, out_h = short_side_resolution(640, 480)
         pose_dict = all_data["poses"]
         if isinstance(pose_dict.get("left"), list):
             left_poses = pose_dict.get("left", [])
@@ -731,7 +747,7 @@ class HandRetargetPipeline:
                 break
             if frame_idx % step != 0:
                 continue
-            # Always resize to SAVED_VIDEO_RESOLUTION for consistent output
+            # Resize to short-side-512 output
             if frame.shape[1] != out_w or frame.shape[0] != out_h:
                 frame = cv2.resize(frame, (out_w, out_h))
             frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
@@ -890,8 +906,9 @@ class EgoDexRetargetPipeline:
         s0 = img_size[0].item() if hasattr(img_size[0], "item") else float(img_size[0])
         s1 = img_size[1].item() if hasattr(img_size[1], "item") else float(img_size[1])
         src_size = [int(round(s0)), int(round(s1))]
+        out_size = short_side_resolution(src_size[0], src_size[1])
         intrinsic_np = scale_intrinsics(
-            intrinsic.detach().cpu().numpy(), src_size, list(SAVED_VIDEO_RESOLUTION)
+            intrinsic.detach().cpu().numpy(), src_size, list(out_size)
         )
 
         left_cam_t = self.projector.world_to_camera(left_world, traj)
@@ -923,7 +940,7 @@ class EgoDexRetargetPipeline:
             axes_uv_left,
             axes_uv_right,
             method_list,
-            SAVED_VIDEO_RESOLUTION,
+            out_size,
             draw_kps,
         )
     
@@ -1022,12 +1039,14 @@ class EgoDexRetargetPipeline:
             video_path = Path(video_path)
 
         intrinsic_np = np.array(all_data["camera"]["intrinsic"], dtype=np.float32)
-        out_w, out_h = SAVED_VIDEO_RESOLUTION
         img_size = all_data.get("camera", {}).get("img_size")
         if img_size and len(img_size) >= 2:
+            out_w, out_h = short_side_resolution(int(img_size[0]), int(img_size[1]))
             intrinsic_np = scale_intrinsics(
                 intrinsic_np, [int(img_size[0]), int(img_size[1])], [out_w, out_h]
             )
+        else:
+            out_w, out_h = short_side_resolution(640, 480)
         pose_dict = all_data["poses"]
         if isinstance(pose_dict.get("left"), list):
             left_poses = pose_dict.get("left", [])
@@ -1056,7 +1075,7 @@ class EgoDexRetargetPipeline:
                 break
             if frame_idx % step != 0:
                 continue
-            # Always resize to SAVED_VIDEO_RESOLUTION for consistent output
+            # Resize to short-side-512 output
             if frame.shape[1] != out_w or frame.shape[0] != out_h:
                 frame = cv2.resize(frame, (out_w, out_h))
             frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
