@@ -27,6 +27,87 @@ def _parse_vec3(s: str) -> np.ndarray:
     return np.array([float(x) for x in s.split(",")])
 
 
+def _set_joint_drives_to_direct(stage, robot_prim_path: str) -> None:
+    """Set joint drive stiffness/damping to max so PD responds instantly (effectively direct set, no overshoot)."""
+    from pxr import UsdPhysics
+
+    STIFFNESS = 1e12
+    DAMPING = 1e8
+    n_set = 0
+
+    def _visit(prim):
+        nonlocal n_set
+        # UsdPhysics.DriveAPI (linear/angular for prismatic/revolute)
+        for api_name in ("linear", "angular", "transX", "transY", "transZ", "rotX", "rotY", "rotZ"):
+            if prim.HasAPI(UsdPhysics.DriveAPI, api_name):
+                drive = UsdPhysics.DriveAPI(prim, api_name)
+                for getter, val in [(drive.GetStiffnessAttr, STIFFNESS), (drive.GetDampingAttr, DAMPING)]:
+                    a = getter()
+                    if a:
+                        a.Set(val)
+                        n_set += 1
+        # Fallback: iterate attributes by name (PhysxDriveAPI not in all pxr versions)
+        for attr in prim.GetAttributes():
+            n = attr.GetName()
+            if "stiffness" in n and "drive" in n:
+                attr.Set(STIFFNESS)
+                n_set += 1
+            elif "damping" in n and "drive" in n:
+                attr.Set(DAMPING)
+                n_set += 1
+        for child in prim.GetChildren():
+            _visit(child)
+
+    prim = stage.GetPrimAtPath(robot_prim_path)
+    if prim.IsValid():
+        _visit(prim)
+        if n_set:
+            print(f"[IsaacSimEnv] Set joint drives to direct (stiffness={STIFFNESS}, damping={DAMPING}, {n_set} attrs)", flush=True)
+
+
+def _disable_robot_collision_and_physics(stage, robot_prim_path: str) -> None:
+    """Disable collision on all prims under robot to prevent gripper jitter (gravity already 0)."""
+    from pxr import PhysxSchema, UsdPhysics
+
+    n_disabled = 0
+
+    def _visit(prim):
+        nonlocal n_disabled
+        # UsdPhysics.CollisionAPI - physics:collisionEnabled
+        if prim.HasAPI(UsdPhysics.CollisionAPI):
+            coll_api = UsdPhysics.CollisionAPI(prim)
+            attr = coll_api.GetCollisionEnabledAttr()
+            if attr:
+                attr.Set(False)
+                n_disabled += 1
+            else:
+                coll_api.CreateCollisionEnabledAttr(False)
+                n_disabled += 1
+        # Direct attribute (some importers use "physics:collisionEnabled")
+        for attr_name in ("physics:collisionEnabled", "collisionEnabled"):
+            a = prim.GetAttribute(attr_name)
+            if a:
+                a.Set(False)
+                n_disabled += 1
+                break
+        # PhysxSchema.PhysxCollisionAPI
+        if prim.HasAPI(PhysxSchema.PhysxCollisionAPI):
+            px_coll = PhysxSchema.PhysxCollisionAPI(prim)
+            for attr_name in ("physics:collisionEnabled", "collisionEnabled"):
+                a = px_coll.GetPrim().GetAttribute(attr_name)
+                if a:
+                    a.Set(False)
+                    n_disabled += 1
+                    break
+        for child in prim.GetChildren():
+            _visit(child)
+
+    prim = stage.GetPrimAtPath(robot_prim_path)
+    if prim.IsValid():
+        _visit(prim)
+        print(f"[IsaacSimEnv] Disabled collision on robot links ({n_disabled} attrs)", flush=True)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Isaac Sim Aloha URDF Environment")
     parser.add_argument(
@@ -138,6 +219,10 @@ class IsaacSimEnv:
             import_config.self_collision = False
         elif hasattr(import_config, "selfCollision"):
             import_config.selfCollision = False
+        # High stiffness/damping to reduce gripper jitter (default_drive_type requires enum, skip)
+        for attr, val in [("default_drive_strength", 1e7), ("default_position_drive_damping", 1e5)]:
+            if hasattr(import_config, attr):
+                setattr(import_config, attr, val)
         # Try enabling mesh materials from DAE; some Isaac Sim versions support this
         for attr in ("use_mesh_materials", "useMeshMaterials", "import_mesh_materials"):
             if hasattr(import_config, attr):
@@ -153,7 +238,7 @@ class IsaacSimEnv:
         self.robot_prim_path: str = result[1] if result and result[1] else "/aloha_tracer2_four_d435_dark"
         print(f"[IsaacSimEnv] Robot loaded at: {self.robot_prim_path}")
 
-        # Kinematic only: disable self-collision and dynamics
+        # Kinematic only: disable self-collision, gravity, physics, and collision
         robot_prim = stage.GetPrimAtPath(self.robot_prim_path)
         if robot_prim.IsValid():
             physx_api = PhysxSchema.PhysxArticulationAPI.Get(stage, self.robot_prim_path)
@@ -183,9 +268,10 @@ class IsaacSimEnv:
             except Exception as e:
                 print(f"[IsaacSimEnv] Semantic label failed (seg may not work): {e}")
 
-        # Left/right arm joint names (7 each: joint1..joint7, no gripper joint8)
-        self._left_joint_names = [f"left_joint{i}" for i in range(1, 8)]
-        self._right_joint_names = [f"right_joint{i}" for i in range(1, 8)]
+        # Left/right arm joint names (8 each: joint1..joint6 arm, joint7/joint8 gripper)
+        # Data has 7 per arm: [j1..j6, gripper_angle]. joint7=gripper_angle, joint8=-gripper_angle
+        self._left_joint_names = [f"left_joint{i}" for i in range(1, 9)]
+        self._right_joint_names = [f"right_joint{i}" for i in range(1, 9)]
         self._articulation = None
         self._left_dof_indices = None
         self._right_dof_indices = None
@@ -226,6 +312,11 @@ class IsaacSimEnv:
             carb.settings.get_settings().set("/app/viewport/showStatistics", True)
 
         self._world.reset()
+
+        # Max drive gains = effectively direct set (no PD overshoot/jitter)
+        _set_joint_drives_to_direct(stage, self.robot_prim_path)
+        # Disable collision on all robot links (prevents gripper jitter from link collision)
+        _disable_robot_collision_and_physics(stage, self.robot_prim_path)
 
         # Replicator render product for rgb + segmentation (first-person camera view)
         self._render_product = None
@@ -525,10 +616,10 @@ class IsaacSimEnv:
             [name_to_idx[n] for n in self._right_joint_names if n in name_to_idx],
             dtype=np.int64,
         )
-        if len(self._left_dof_indices) != 7 or len(self._right_dof_indices) != 7:
+        if len(self._left_dof_indices) != 8 or len(self._right_dof_indices) != 8:
             print(
                 f"[IsaacSimEnv] Warning: left DOFs {len(self._left_dof_indices)}, right {len(self._right_dof_indices)}; "
-                "expected 7 each. Check URDF and joint names."
+                "expected 8 each (joint1..8). Check URDF and joint names."
             )
 
     def set_joint(
@@ -536,10 +627,10 @@ class IsaacSimEnv:
         left_joint_angle: np.ndarray,
         right_joint_angle: np.ndarray,
     ) -> None:
-        """Set left/right arm joint angles (7 each); no physics, write current pose.
+        """Set left/right arm + gripper joints.
 
-        - left_joint_angle: shape (7,) radians, fl_joint1..fl_joint7
-        - right_joint_angle: shape (7,) radians, fr_joint1..fr_joint7
+        Input: shape (7,) per arm [joint1..joint6, gripper_angle].
+        Robot: joint7=gripper_angle, joint8=-gripper_angle (prismatic, meters).
         """
         left_joint_angle = np.asarray(left_joint_angle, dtype=np.float64)
         right_joint_angle = np.asarray(right_joint_angle, dtype=np.float64)
@@ -548,9 +639,14 @@ class IsaacSimEnv:
                 "set_joint requires left_joint_angle and right_joint_angle shape (7,); "
                 f"got {left_joint_angle.shape} and {right_joint_angle.shape}"
             )
+        # Expand: [j1..j6, gripper] -> [j1..j6, gripper, -gripper]
+        g_left = float(left_joint_angle[6])
+        g_right = float(right_joint_angle[6])
+        left_8 = np.concatenate([left_joint_angle[:6], [g_left, -g_left]])
+        right_8 = np.concatenate([right_joint_angle[:6], [g_right, -g_right]])
         self._ensure_articulation()
         indices = np.concatenate([self._left_dof_indices, self._right_dof_indices])
-        positions = np.concatenate([left_joint_angle, right_joint_angle])
+        positions = np.concatenate([left_8, right_8])
         self._articulation.set_joint_positions(positions, indices)
 
     # ------------------------------------------------------------------
@@ -636,8 +732,8 @@ def _gather_clip_dirs(input_dir: str) -> list[str]:
 def _filter_pending_clips(clip_dirs: list[str], output_dir: str, verify_video: bool = False) -> list[str]:
     """Return clips that still need rendering.
 
-    Logic: from output_dir/video/ get existing clip_ids, verify each. If ok -> remove from
-    clip_dirs (skip). If fail -> delete video. Return clip_dirs minus the skipped ones.
+    Logic: skip only when BOTH mask and video exist for clip_id. If only one exists,
+    delete the orphan and do not skip.
     """
     if not output_dir:
         return clip_dirs
@@ -655,49 +751,46 @@ def _filter_pending_clips(clip_dirs: list[str], output_dir: str, verify_video: b
                 except OSError:
                     pass
         if removed:
-            print(f"[IsaacSim] Removed {removed} stale .tmp.mp4 file(s)", flush=True)
+            print(f"[IsaacSim] Removed {removed} stale .tmp.mp4", flush=True)
 
     clip_id_to_dir = {os.path.basename(d.rstrip("/")): d for d in clip_dirs}
 
-    if not os.path.isdir(video_dir):
-        print(f"[IsaacSim] {len(clip_dirs)} to render (no output dir yet)", flush=True)
-        return clip_dirs
-
-    to_verify = []
-    for f in os.listdir(video_dir):
-        if not f.endswith(".mp4"):
-            continue
-        clip_id = f[:-4]
-        if clip_id not in clip_id_to_dir:
-            continue
-        to_verify.append((clip_id, os.path.join(video_dir, f)))
+    video_has = {}  # clip_id -> path
+    if os.path.isdir(video_dir):
+        for f in os.listdir(video_dir):
+            if f.endswith(".mp4") and not f.endswith(".tmp.mp4"):
+                cid = f[:-4]
+                if cid in clip_id_to_dir:
+                    video_has[cid] = os.path.join(video_dir, f)
 
     skip_ok = set()
-    if to_verify and verify_video:
-        print(f"[IsaacSim] Verifying {len(to_verify)} videos in {video_dir}", flush=True)
-        n_total = len(to_verify)
-        for i, (clip_id, out_path) in enumerate(to_verify):
+    if video_has and verify_video:
+        print(f"[IsaacSim] Verifying {len(video_has)} videos", flush=True)
+        n_total = len(video_has)
+        for i, cid in enumerate(sorted(video_has)):
             if (i + 1) % 10 == 0 or i == 0 or i == n_total - 1:
                 print(f"\r[IsaacSim] Verify: {i + 1}/{n_total}", end="", flush=True)
+            ok = True
+            path = video_has[cid]
             try:
                 import imageio
-                r = imageio.get_reader(out_path)
+                r = imageio.get_reader(path)
                 try:
                     r.get_data(0)
                 finally:
                     r.close()
-                skip_ok.add(clip_id)
             except Exception:
+                ok = False
                 try:
-                    os.remove(out_path)
+                    os.remove(path)
                 except OSError:
                     pass
-        print(f"[IsaacSim] Verify done: {len(skip_ok)} ok (skip), {len(to_verify) - len(skip_ok)} deleted", flush=True)
-    else:
-        skip_ok = {cid for cid, _ in to_verify}
-        if skip_ok:
-            print(f"[IsaacSim] Skipping {len(skip_ok)} clips (already have mp4)", flush=True)
-            time.sleep(5)
+            if ok:
+                skip_ok.add(cid)
+        print(f"[IsaacSim] Verify done: {len(skip_ok)} ok (skip)", flush=True)
+    elif video_has:
+        skip_ok = set(video_has.keys())
+        print(f"[IsaacSim] Skipping {len(skip_ok)} clips (have video)", flush=True)
 
     pending = [clip_id_to_dir[cid] for cid in clip_id_to_dir if cid not in skip_ok]
     print(f"[IsaacSim] {len(pending)} to render", flush=True)
@@ -813,8 +906,8 @@ def _render_single_clip(env: IsaacSimEnv, data_dir: str, opts: argparse.Namespac
         try:
             import imageio
 
-            tmp_path = output_video_path.replace(".mp4", ".tmp.mp4")
-            writer = imageio.get_writer(tmp_path, fps=fps_meta, codec="libx264", macro_block_size=1)
+            tmp_video = output_video_path.replace(".mp4", ".tmp.mp4")
+            writer = imageio.get_writer(tmp_video, fps=fps_meta, codec="libx264", macro_block_size=1)
         except ImportError:
             writer = None
 
@@ -883,7 +976,7 @@ def _render_single_clip(env: IsaacSimEnv, data_dir: str, opts: argparse.Namespac
                             )
                             mask = (
                                 np.asarray(
-                                    Image.fromarray(mask * 255).resize((render_w, render_h), Image.NEAREST)
+                                    Image.fromarray(mask.astype(np.uint8) * 255).resize((render_w, render_h), Image.NEAREST)
                                 )
                                 > 127
                             )
@@ -891,9 +984,9 @@ def _render_single_clip(env: IsaacSimEnv, data_dir: str, opts: argparse.Namespac
                         bg[mask.astype(bool)] = robot_rgb[mask.astype(bool)]
                         out_frame = bg
                     else:
-                        out_frame = np.stack([mask * 255] * 3, axis=-1)
+                        out_frame = robot_rgb
                 else:
-                    out_frame = np.stack([mask * 255] * 3, axis=-1)
+                    out_frame = robot_rgb
                 writer.append_data(out_frame[:, :, :3])
         elif not do_render:
             env.set_joint(left_q, right_q)
