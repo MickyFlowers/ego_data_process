@@ -146,6 +146,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--render-height", type=int, default=512)
     parser.add_argument("--render-size", type=int, default=512, help="Square resolution for render (default: 512x512)")
     parser.add_argument("--render-scale", type=float, default=1.0, help="Scale resolution for speed (e.g. 0.5 = half res)")
+    parser.add_argument("--render-warmup", type=int, default=5, help="Warmup renders before first frame to avoid artifacts (default: 5)")
     parser.add_argument(
         "--verify-video",
         action="store_true",
@@ -919,6 +920,12 @@ def _render_single_clip(env: IsaacSimEnv, data_dir: str, opts: argparse.Namespac
         for _ in range(2):
             env.step(render=do_render)
 
+    # Warmup: first render often has artifacts, render first frame multiple times before capturing
+    warmup_count = _get("render_warmup", 5)
+    if do_render and writer is not None and n_frames > 0 and warmup_count > 0:
+        for _ in range(warmup_count):
+            env.render_frame(left_q0, right_q0)
+
     t_start = time.time()
     for frame_idx in range(n_frames):
         if not env.is_running():
@@ -1076,6 +1083,7 @@ def _run_multiprocessing_batch(args: argparse.Namespace, clip_dirs: list[str]) -
         "render_width": getattr(args, "render_width", 512),
         "render_height": getattr(args, "render_height", 512),
         "render_scale": getattr(args, "render_scale", 1.0),
+        "render_warmup": getattr(args, "render_warmup", 5),
         "render_size": getattr(args, "render_size", 512),
         "no_overlay": args.no_overlay,
         "video_path": getattr(args, "video_path", None),
