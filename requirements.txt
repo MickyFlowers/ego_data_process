@@ -1,5 +1,6 @@
 pybullet
 ray
+tqdm
 opencv-python-headless
 scipy
 imageio

@@ -8,9 +8,14 @@
 """
 import argparse
 import json
-import os
 import xml.etree.ElementTree as ET
 from pathlib import Path
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, **kwargs):
+        return iterable
 
 
 def parse_joint_limits_from_urdf(urdf_path: str) -> dict[str, tuple[float, float]]:
@@ -168,7 +173,7 @@ def main() -> None:
     total_violations = 0
     clips_with_violations = 0
 
-    for tf in traj_files:
+    for tf in tqdm(traj_files, desc="检查 clip"):
         res = check_trajectory(str(tf), limits, verbose=not args.quiet)
         total_violations += res["total_violations"]
         if res["total_violations"] > 0:
