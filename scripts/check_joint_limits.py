@@ -8,6 +8,7 @@
 """
 import argparse
 import json
+import os
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -164,7 +165,14 @@ def main() -> None:
         if j in limits:
             print(f"  {j}: [{limits[j][0]:.4f}, {limits[j][1]:.4f}]")
 
-    traj_files = sorted(data_dir.glob("*/joint_trajectory.json"))
+    # 使用 os.scandir 替代 glob，速度更快
+    traj_files = []
+    for entry in os.scandir(data_dir):
+        if entry.is_dir(follow_symlinks=False):
+            p = Path(entry.path) / "joint_trajectory.json"
+            if p.is_file():
+                traj_files.append(p)
+    traj_files.sort()
     if not traj_files:
         print(f"在 {data_dir} 下未找到 joint_trajectory.json")
         return
