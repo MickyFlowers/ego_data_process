@@ -98,13 +98,29 @@ def process_clip_remote(
         }
 
 
+def _load_paths_from_clip_parts(path: str) -> list[Path]:
+    """从 clip_parts.json 加载路径列表。支持 [[path,...],...] 或 [path,...] 格式。"""
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    paths = []
+    for item in data:
+        if isinstance(item, list):
+            for p in item:
+                if isinstance(p, str) and p:
+                    paths.append(Path(p))
+        elif isinstance(item, str) and item:
+            paths.append(Path(item))
+    return paths
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Ray parallel batch retarget (.pose3d_hand -> JSON + optional replay video)"
+        description="Ray parallel batch retarget (HDF5 -> JSON + optional replay video)"
     )
-    parser.add_argument("--data-dir", type=str, required=True, help="Input dir (searched recursively for .pose3d_hand)")
+    parser.add_argument("--data-dir", type=str, default=None, help="Input dir (searched for .hdf5)。与 --clip-parts 二选一")
+    parser.add_argument("--clip-parts", type=str, default=None, help="clip_parts.json 路径，从中读取 .hdf5 路径列表，替代文件夹扫描")
     parser.add_argument("-o", "--output-dir", type=str, required=True, help="Output root directory")
-    parser.add_argument("--no-recursive", action="store_true", help="Only look in data-dir, not subdirs")
+    parser.add_argument("--no-recursive", action="store_true", help="Only look in data-dir, not subdirs（仅 --data-dir 时有效）")
     parser.add_argument("-m", "--model-dir", type=str,
                         default="./assets/mano_v1_2/models",
                         help="MANO model directory")
@@ -118,23 +134,42 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed for sampling")
     args = parser.parse_args()
 
-    input_dir = Path(args.data_dir).resolve()
-    if not input_dir.is_dir():
-        raise SystemExit(f"Input path is not a directory: {input_dir}")
+    def _clip_id_from_hdf5(p: Path) -> str:
+        part_id = p.parent.parent.stem
+        hdf5_task_id = p.parent.stem
+        return f"{part_id}_{hdf5_task_id}_{p.stem}"
 
-    if args.no_recursive:
-        candidates = sorted(input_dir.glob("*.hdf5"))
+    if args.clip_parts and Path(args.clip_parts).is_file():
+        paths = _load_paths_from_clip_parts(args.clip_parts)
+        paths = [p for p in paths if str(p).lower().endswith(".hdf5")]
+        seen: set[str] = set()
+        files = []
+        for p in paths:
+            cid = _clip_id_from_hdf5(Path(p))
+            if cid not in seen:
+                seen.add(cid)
+                files.append(Path(p))
+        print(f"[Batch] --clip-parts: {len(files)} 个 .hdf5 路径")
+    elif args.data_dir:
+        input_dir = Path(args.data_dir).resolve()
+        if not input_dir.is_dir():
+            raise SystemExit(f"Input path is not a directory: {input_dir}")
+        if args.no_recursive:
+            candidates = sorted(input_dir.glob("*.hdf5"))
+        else:
+            candidates = sorted(input_dir.rglob("*.hdf5"), key=lambda p: (p.stem, str(p)))
+        seen = set()
+        files = []
+        for p in candidates:
+            cid = _clip_id_from_hdf5(p)
+            if cid not in seen:
+                seen.add(cid)
+                files.append(p)
     else:
-        candidates = sorted(input_dir.rglob("*.hdf5"), key=lambda p: (p.stem, str(p)))
-    # One path per clip_id (first found wins)
-    seen: set[str] = set()
-    files = []
-    for p in candidates:
-        if p not in seen:
-            seen.add(p)
-            files.append(p)
+        raise SystemExit("需要指定 --data-dir 或 --clip-parts 之一")
+
     if not files:
-        print(f"[Batch] No .hdf5 files under {input_dir}")
+        print(f"[Batch] 无 .hdf5 文件")
         return
 
     n_total = len(files)
@@ -180,7 +215,7 @@ def main():
             str(fp), args.output_dir, args.model_dir,
             args.methods, do_replay, args.replay_frame_ratio,
         ))
-        clip_ids.append(fp.stem)
+        clip_ids.append(_clip_id_from_hdf5(fp))
 
     t_start = time.time()
     results = []

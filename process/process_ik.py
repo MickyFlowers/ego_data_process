@@ -38,7 +38,6 @@ Usage:
 
 import argparse
 import collections
-import glob
 import json
 import math
 import os
@@ -197,6 +196,16 @@ def main():
         if not json_files:
             print(f"[Batch] 无匹配文件，退出")
             return
+    else:
+        try:
+            with os.scandir(args.input_dir) as it:
+                json_files = [p.path for p in it if p.name.endswith(".json")]
+        except OSError:
+            json_files = []
+        if not json_files:
+            print(f"[Batch] No JSON files found in {args.input_dir}")
+            return
+        print(f"[Batch] 使用 {len(json_files)} 个 JSON 文件")
 
     n_total = len(json_files)
     n_sample = max(1, math.ceil(n_total * args.sample_ratio))
