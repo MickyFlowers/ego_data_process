@@ -9,8 +9,11 @@ Output:
     {output_dir}/video/{clip_id}.mp4  (机器人叠加重叠原视频，或仅机器人)
     {output_dir}/mask/{clip_id}.mp4   (二值分割 mask)
 
+默认短边 512（等比例缩放，如 1920×1080 -> 910×512）。
+
 Usage:
     python -m process.process_render_filtered --filter-result /path/to/filter_result.json --data-dir /path/to/ik/data --output-dir outputs/render
+    python -m process.process_render_filtered --filter-result filter_result_part0.json --output-dir outputs/render --no-ray  # 避免 Ray GCS 连接失败
 """
 from __future__ import annotations
 
@@ -72,16 +75,22 @@ def main() -> None:
         help="URDF 路径",
     )
     parser.add_argument(
+        "--short-side",
+        type=int,
+        default=512,
+        help="短边缩放（等比例），0 表示使用固定 --width/--height",
+    )
+    parser.add_argument(
         "--width",
         type=int,
         default=RENDER_RESOLUTION[0],
-        help="渲染宽度",
+        help="渲染宽度（--short-side 为 0 时生效）",
     )
     parser.add_argument(
         "--height",
         type=int,
         default=RENDER_RESOLUTION[1],
-        help="渲染高度",
+        help="渲染高度（--short-side 为 0 时生效）",
     )
     parser.add_argument(
         "--num-cpus",
@@ -94,6 +103,17 @@ def main() -> None:
         type=int,
         default=None,
         help="Ray 总 GPU 数",
+    )
+    parser.add_argument(
+        "--no-ray",
+        action="store_true",
+        help="禁用 Ray，使用 multiprocessing（避免 GCS 连接失败）。与 process_ik 不同，无 Ray 依赖。",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help="并行 worker 数。--no-ray 时生效；默认等于 min(num_cpus, n_render)。",
     )
     args = parser.parse_args()
 
@@ -121,20 +141,51 @@ def main() -> None:
     os.makedirs(os.path.join(args.output_dir, "video"), exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, "mask"), exist_ok=True)
 
-    # ---- Ray 初始化 ----
-    ray_kwargs: dict = {}
-    if args.num_cpus is not None:
-        ray_kwargs["num_cpus"] = args.num_cpus
-    if args.num_gpus is not None:
-        ray_kwargs["num_gpus"] = args.num_gpus
-    ray.init(**ray_kwargs)
-
-    cluster = ray.cluster_resources()
-    total_cpus = int(cluster.get("CPU", 1))
-    total_gpus = cluster.get("GPU", 0)
-    num_workers = max(1, min(total_cpus, n_render))
-    cpus_per_worker = max(0.5, total_cpus / num_workers)
-    gpus_per_worker = total_gpus / num_workers if total_gpus > 0 else 0
+    use_ray = not args.no_ray
+    num_workers = args.num_workers
+    total_cpus = 1
+    cluster = {}
+    if num_workers is None:
+        if use_ray:
+            try:
+                ray_kwargs = {}
+                if args.num_cpus is not None:
+                    ray_kwargs["num_cpus"] = args.num_cpus
+                if args.num_gpus is not None:
+                    ray_kwargs["num_gpus"] = args.num_gpus
+                ray_kwargs["ignore_reinit_error"] = True
+                ray.init(**ray_kwargs)
+                cluster = ray.cluster_resources()
+                total_cpus = int(cluster.get("CPU", 1))
+                num_workers = max(1, min(total_cpus, n_render))
+            except Exception as e:
+                print(f"[RenderFiltered] Ray init 失败 (GCS 连接等): {e}", flush=True)
+                print("[RenderFiltered] 回退到 --no-ray 模式，运行前可执行 ray stop 清理残留", flush=True)
+                use_ray = False
+                import multiprocessing
+                total_cpus = multiprocessing.cpu_count()
+                num_workers = max(1, min(total_cpus, n_render))
+        else:
+            import multiprocessing
+            total_cpus = multiprocessing.cpu_count()
+            num_workers = max(1, min(total_cpus, n_render))
+    else:
+        num_workers = max(1, num_workers)
+        if use_ray:
+            try:
+                ray_kwargs = {"ignore_reinit_error": True}
+                if args.num_cpus is not None:
+                    ray_kwargs["num_cpus"] = args.num_cpus
+                if args.num_gpus is not None:
+                    ray_kwargs["num_gpus"] = args.num_gpus
+                ray.init(**ray_kwargs)
+                cluster = ray.cluster_resources()
+                total_cpus = int(cluster.get("CPU", 1))
+            except Exception as e:
+                print(f"[RenderFiltered] Ray init 失败: {e}，回退到 --no-ray", flush=True)
+                use_ray = False
+                import multiprocessing
+                total_cpus = multiprocessing.cpu_count()
 
     worker_clips: list[list[str]] = [[] for _ in range(num_workers)]
     for i, cd in enumerate(clip_dirs):
@@ -143,44 +194,62 @@ def main() -> None:
         (w, clips) for w, clips in enumerate(worker_clips) if clips
     ]
 
-    print(f"[RenderFiltered] {num_workers} workers, {total_cpus} CPUs")
+    print(f"[RenderFiltered] {num_workers} workers ({'Ray' if use_ray else 'multiprocessing'}), {total_cpus} CPUs")
     for w, clips in active:
         print(f"  Worker {w}: {len(clips)} clips")
 
-    # ---- process_render 的 render_worker 只支持 seg_only 或 video，需要同时输出 mask+video
-    # 使用 seg_only=False 得到 overlay video，但 process_render 不写 mask。
-    # 因此我们改为调用两次：一次 seg_only（写 mask），一次非 seg_only（写 video）。
-    # 更优：扩展 render_worker 支持 output_both。这里为简化，先 run 两次。
-    # 实际上单次 run 可同时写两个 writer，但需改 process_render。
-    # 方案：复制 render_worker 逻辑到本地，增加 mask_writer，一次循环写两份。
-
-    # 使用自定义 worker，输出 video + mask
-    task_opts: dict = {"num_cpus": cpus_per_worker}
-    if gpus_per_worker > 0:
-        task_opts["num_gpus"] = gpus_per_worker
-
     t_start = time.time()
-    future_to_worker: dict = {}
-    pending_futures: list = []
-    for w, clips in active:
-        fut = render_worker_both.options(**task_opts).remote(
-            clip_dirs=clips,
-            output_dir=args.output_dir,
-            urdf_path=os.path.abspath(args.urdf_path),
-            render_width=args.width,
-            render_height=args.height,
-            worker_id=w,
-        )
-        future_to_worker[fut] = (w, clips)
-        pending_futures.append(fut)
-
     all_results: list[dict] = []
-    while pending_futures:
-        done, pending_futures = ray.wait(pending_futures, num_returns=1)
-        for fut in done:
-            w, clips = future_to_worker[fut]
-            try:
-                worker_results = ray.get(fut)
+
+    if use_ray:
+        cpus_per_worker = max(0.5, total_cpus / num_workers)
+        gpus_per_worker = cluster.get("GPU", 0) / num_workers if cluster.get("GPU", 0) else 0
+        task_opts: dict = {"num_cpus": cpus_per_worker}
+        if gpus_per_worker > 0:
+            task_opts["num_gpus"] = gpus_per_worker
+        future_to_worker: dict = {}
+        pending_futures: list = []
+        for w, clips in active:
+            fut = render_worker_both.options(**task_opts).remote(
+                clip_dirs=clips,
+                output_dir=args.output_dir,
+                urdf_path=os.path.abspath(args.urdf_path),
+                render_width=args.width,
+                render_height=args.height,
+                worker_id=w,
+                short_side=args.short_side,
+            )
+            future_to_worker[fut] = (w, clips)
+            pending_futures.append(fut)
+        while pending_futures:
+            done, pending_futures = ray.wait(pending_futures, num_returns=1)
+            for fut in done:
+                w, clips = future_to_worker[fut]
+                try:
+                    worker_results = ray.get(fut)
+                    all_results.extend(worker_results)
+                    n_ok = sum(1 for r in worker_results if "error" not in r)
+                    print(
+                        f"[RenderFiltered] Worker {w}: {n_ok}/{len(worker_results)} ok "
+                        f"({len(all_results)}/{n_render} total)",
+                        flush=True,
+                    )
+                except Exception as e:
+                    print(f"[RenderFiltered] Worker {w} failed: {e}", file=sys.stderr, flush=True)
+                    for cd in clips:
+                        all_results.append({"clip_id": os.path.basename(cd), "error": str(e)})
+        ray.shutdown()
+    else:
+        import multiprocessing
+        with multiprocessing.Pool(num_workers) as pool:
+            worker_args = [
+                (clips, args.output_dir, os.path.abspath(args.urdf_path), args.width, args.height, w, args.short_side)
+                for w, clips in active
+            ]
+            for (w, clips), worker_results in zip(
+                active,
+                pool.starmap(_render_clips_batch, worker_args),
+            ):
                 all_results.extend(worker_results)
                 n_ok = sum(1 for r in worker_results if "error" not in r)
                 print(
@@ -188,10 +257,6 @@ def main() -> None:
                     f"({len(all_results)}/{n_render} total)",
                     flush=True,
                 )
-            except Exception as e:
-                print(f"[RenderFiltered] Worker {w} failed: {e}", file=sys.stderr, flush=True)
-                for cd in clips:
-                    all_results.append({"clip_id": os.path.basename(cd), "error": f"Worker {w} failed: {e}"})
 
     total_time = time.time() - t_start
     success = [r for r in all_results if "error" not in r]
@@ -218,25 +283,24 @@ def main() -> None:
         for r in failed:
             print(f"  {r['clip_id']}: {r['error']}", file=sys.stderr)
 
-    ray.shutdown()
     if failed:
         sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
-# 自定义 worker：同时输出 video 和 mask（与 process_render 逻辑一致）
+# 渲染逻辑（可被 Ray 或 multiprocessing 调用）
 # ---------------------------------------------------------------------------
 
-@ray.remote
-def render_worker_both(
+def _render_clips_batch(
     clip_dirs: list[str],
     output_dir: str,
     urdf_path: str,
     render_width: int,
     render_height: int,
     worker_id: int,
+    short_side: int = 512,
 ) -> list[dict]:
-    """PyBullet 渲染，同时输出 video/ 和 mask/。"""
+    """渲染一批 clip，输出 video 和 mask。供 multiprocessing 或 Ray 调用。"""
     import pybullet as p
     import pybullet_data
     import imageio
@@ -249,6 +313,7 @@ def render_worker_both(
         build_view_matrix_from_camera_matrix,
         build_projection_matrix_from_intrinsics,
         scale_intrinsics,
+        short_side_resolution,
     )
 
     cid = p.connect(p.DIRECT)
@@ -309,11 +374,16 @@ def render_worker_both(
         camera_intrinsics = np.array(meta["camera_intrinsics"], dtype=np.float64)
         camera_extrinsics = np.array(meta["camera_extrinsics"], dtype=np.float64)
         img_size = meta.get("img_size", [render_width, render_height])
+        iw, ih = max(1, img_size[0]), max(1, img_size[1])
+        if short_side > 0:
+            rw, rh = short_side_resolution(iw, ih, short_side)
+        else:
+            rw, rh = render_width, render_height
 
-        render_K = scale_intrinsics(camera_intrinsics, img_size, [render_width, render_height])
+        render_K = scale_intrinsics(camera_intrinsics, img_size, [rw, rh])
         view_matrix = build_view_matrix_from_camera_matrix(camera_extrinsics)
         proj_matrix = build_projection_matrix_from_intrinsics(
-            render_K, render_width, render_height
+            render_K, rw, rh
         )
 
         source_reader = None
@@ -351,11 +421,11 @@ def render_worker_both(
                 ([-1.0, 0.5, 0.8], 0.30, 0),
                 ([0.0, -0.5, 1.0], 0.25, 0),
             ]
-            accum = np.zeros((render_height, render_width, 3), dtype=np.float64)
+            accum = np.zeros((rh, rw, 3), dtype=np.float64)
             seg_out = None
             for l_dir, l_weight, l_shadow in light_configs:
                 _, _, _rgba, _, _seg = p.getCameraImage(
-                    render_width, render_height,
+                    rw, rh,
                     viewMatrix=view_matrix,
                     projectionMatrix=proj_matrix,
                     shadow=l_shadow,
@@ -368,19 +438,17 @@ def render_worker_both(
                     renderer=renderer,
                 )
                 _rgb = np.asarray(_rgba, dtype=np.uint8).reshape(
-                    (render_height, render_width, 4))[:, :, :3]
+                    (rh, rw, 4))[:, :, :3]
                 accum += _rgb.astype(np.float64) * l_weight
                 if seg_out is None:
                     seg_out = _seg
 
             robot_rgb = np.clip(accum, 0, 255).astype(np.uint8)
-            mask = np.asarray(seg_out).reshape((render_height, render_width)) >= 0
+            mask = np.asarray(seg_out).reshape((rh, rw)) >= 0
 
-            # 写 mask
             mask_uint8 = (mask.astype(np.uint8) * 255)
             mask_writer.append_data(np.stack([mask_uint8] * 3, axis=-1))
 
-            # 写 video（overlay 或仅机器人）
             bg = None
             if source_reader is not None:
                 try:
@@ -395,7 +463,7 @@ def render_worker_both(
                     bg = bg[..., :3]
                 bg_h, bg_w = bg.shape[:2]
                 if need_resize is None:
-                    need_resize = (render_width, render_height) != (bg_w, bg_h)
+                    need_resize = (rw, rh) != (bg_w, bg_h)
                 if need_resize:
                     robot_rgb = np.asarray(
                         Image.fromarray(robot_rgb).resize((bg_w, bg_h), Image.BILINEAR)
@@ -406,9 +474,9 @@ def render_worker_both(
                 else:
                     mask_resized = mask
                 bg[mask_resized] = robot_rgb[mask_resized]
-                if (bg_w, bg_h) != (render_width, render_height):
+                if (bg_w, bg_h) != (rw, rh):
                     bg = np.asarray(
-                        Image.fromarray(bg).resize((render_width, render_height), Image.BILINEAR)
+                        Image.fromarray(bg).resize((rw, rh), Image.BILINEAR)
                     )
                 video_writer.append_data(bg[:, :, :3])
             else:
@@ -445,6 +513,22 @@ def render_worker_both(
     elapsed = time.time() - t0
     print(f"{tag} Done: {len(results)} clips, {total_frames_written} frames, {elapsed:.0f}s", flush=True)
     return results
+
+
+@ray.remote
+def render_worker_both(
+    clip_dirs: list[str],
+    output_dir: str,
+    urdf_path: str,
+    render_width: int,
+    render_height: int,
+    worker_id: int,
+    short_side: int = 512,
+) -> list[dict]:
+    """Ray remote: 调用 _render_clips_batch。"""
+    return _render_clips_batch(
+        clip_dirs, output_dir, urdf_path, render_width, render_height, worker_id, short_side
+    )
 
 
 if __name__ == "__main__":

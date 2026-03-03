@@ -394,6 +394,10 @@ def parse_arm_info(robot_id: int) -> dict[str, Any]:
     ]
     all_bounds = left_bounds + right_bounds
 
+    # 全机器人 DOF 的 joint limits（供 calculateInverseKinematics 使用）
+    lower_limits = [p.getJointInfo(robot_id, j)[8] for j in dof_per_joint]
+    upper_limits = [p.getJointInfo(robot_id, j)[9] for j in dof_per_joint]
+
     return {
         "robot_id": robot_id,
         "left_arm_joint_indices": left_arm_joint_indices,
@@ -408,6 +412,8 @@ def parse_arm_info(robot_id: int) -> dict[str, Any]:
         "rest_poses": rest_poses,
         "cross_arm_pairs": cross_arm_pairs,
         "all_bounds": all_bounds,
+        "lower_limits": lower_limits,
+        "upper_limits": upper_limits,
     }
 
 
@@ -537,6 +543,8 @@ def _ik_solve_single_arm(
     rest_poses: list[float],
     prev_q: list[float] | None,
     jump_threshold: float,
+    lower_limits: list[float] | None = None,
+    upper_limits: list[float] | None = None,
 ) -> tuple[list[float], bool]:
     """
     Solve IK for one arm with branch-jump protection (rate-limited).
@@ -552,22 +560,33 @@ def _ik_solve_single_arm(
     max_iters = 500 if is_first else 100
     res_thr = 1e-6 if is_first else 1e-5
 
-    q_all = p.calculateInverseKinematics(
-        rid, tcp_link, pos, quat,
-        maxNumIterations=max_iters, residualThreshold=res_thr, restPoses=rest_poses,
-    )
+    ik_kwargs = dict(maxNumIterations=max_iters, residualThreshold=res_thr, restPoses=rest_poses)
+    if lower_limits is not None and upper_limits is not None:
+        ik_kwargs["lowerLimits"] = lower_limits
+        ik_kwargs["upperLimits"] = upper_limits
+    q_all = p.calculateInverseKinematics(rid, tcp_link, pos, quat, **ik_kwargs)
     q = [q_all[k] for k in dof_indices]
+    # Clamp to joint limits (IK 可能因数值误差略超限)
+    if lower_limits is not None and upper_limits is not None:
+        for k in range(len(q)):
+            d = dof_indices[k]
+            q[k] = max(lower_limits[d], min(upper_limits[d], q[k]))
 
     # First frame: commit immediately then re-solve to let IK refine from its own solution
     if is_first:
         for k, j in enumerate(arm_joint_indices):
             p.resetJointState(rid, j, q[k])
             rest_poses[dof_per_joint.index(j)] = q[k]
-        q_all = p.calculateInverseKinematics(
-            rid, tcp_link, pos, quat,
-            maxNumIterations=500, residualThreshold=1e-7, restPoses=rest_poses,
-        )
+        refine_kwargs = dict(maxNumIterations=500, residualThreshold=1e-7, restPoses=rest_poses)
+        if lower_limits is not None and upper_limits is not None:
+            refine_kwargs["lowerLimits"] = lower_limits
+            refine_kwargs["upperLimits"] = upper_limits
+        q_all = p.calculateInverseKinematics(rid, tcp_link, pos, quat, **refine_kwargs)
         q = [q_all[k] for k in dof_indices]
+        if lower_limits is not None and upper_limits is not None:
+            for k in range(len(q)):
+                d = dof_indices[k]
+                q[k] = max(lower_limits[d], min(upper_limits[d], q[k]))
 
     rate_limited = False
     if prev_q is not None:
@@ -576,14 +595,19 @@ def _ik_solve_single_arm(
             # Retry with joints reset to previous frame
             for k, j in enumerate(arm_joint_indices):
                 p.resetJointState(rid, j, prev_q[k])
-            q_all2 = p.calculateInverseKinematics(
-                rid, tcp_link, pos, quat,
-                maxNumIterations=300, residualThreshold=1e-6, restPoses=rest_poses,
-            )
+            ik_kwargs2 = dict(maxNumIterations=300, residualThreshold=1e-6, restPoses=rest_poses)
+            if lower_limits is not None and upper_limits is not None:
+                ik_kwargs2["lowerLimits"] = lower_limits
+                ik_kwargs2["upperLimits"] = upper_limits
+            q_all2 = p.calculateInverseKinematics(rid, tcp_link, pos, quat, **ik_kwargs2)
             q2 = [q_all2[k] for k in dof_indices]
             d2 = max(abs(q2[k] - prev_q[k]) for k in range(len(q2)))
             if d2 < max_d:
                 q = q2
+                if lower_limits is not None and upper_limits is not None:
+                    for k in range(len(q)):
+                        d = dof_indices[k]
+                        q[k] = max(lower_limits[d], min(upper_limits[d], q[k]))
                 max_d = d2
             if max_d > jump_threshold:
                 # Rate-limit: move toward solution but cap step per joint
@@ -592,6 +616,12 @@ def _ik_solve_single_arm(
                     if abs(delta) > jump_threshold:
                         q[k] = prev_q[k] + jump_threshold * (1.0 if delta > 0 else -1.0)
                 rate_limited = True
+
+    # Clamp to joint limits before commit
+    if lower_limits is not None and upper_limits is not None:
+        for k in range(len(q)):
+            d = dof_indices[k]
+            q[k] = max(lower_limits[d], min(upper_limits[d], q[k]))
 
     # Commit: update joint states and restPoses
     for k, j in enumerate(arm_joint_indices):
@@ -627,6 +657,8 @@ def solve_dual_arm_ik(
     rid = robot_info["robot_id"]
     left_tcp = robot_info["left_tcp_link_index"]
     right_tcp = robot_info["right_tcp_link_index"]
+    lower_limits = robot_info.get("lower_limits")
+    upper_limits = robot_info.get("upper_limits")
 
     if verbose:
         print(f"[IK] Solving dual-arm IK for {n_frames} frames (jump_thresh={jump_threshold:.2f} rad) ...")
@@ -642,17 +674,19 @@ def solve_dual_arm_ik(
         prev_l = left_traj[-1] if left_traj else None
         prev_r = right_traj[-1] if right_traj else None
 
-        # --- Left arm IK (with jump protection) ---
+        # --- Left arm IK (with jump protection + joint limits) ---
         q_left, l_clamped = _ik_solve_single_arm(
             rid, left_tcp, l_pos, l_quat,
             left_dof_indices, left_arm_joint_indices, dof_per_joint,
             rest_poses, prev_l, jump_threshold,
+            lower_limits=lower_limits, upper_limits=upper_limits,
         )
-        # --- Right arm IK (with jump protection) ---
+        # --- Right arm IK (with jump protection + joint limits) ---
         q_right, r_clamped = _ik_solve_single_arm(
             rid, right_tcp, r_pos, r_quat,
             right_dof_indices, right_arm_joint_indices, dof_per_joint,
             rest_poses, prev_r, jump_threshold,
+            lower_limits=lower_limits, upper_limits=upper_limits,
         )
 
         if l_clamped or r_clamped:
@@ -690,6 +724,14 @@ def solve_dual_arm_ik(
                     delta = q_right[k] - prev_r[k]
                     if abs(delta) > jump_threshold:
                         q_right[k] = prev_r[k] + jump_threshold * (1.0 if delta > 0 else -1.0)
+            # Clamp to joint limits
+            if lower_limits is not None and upper_limits is not None:
+                for k in range(6):
+                    d = left_dof_indices[k]
+                    q_left[k] = max(lower_limits[d], min(upper_limits[d], q_left[k]))
+                for k in range(6):
+                    d = right_dof_indices[k]
+                    q_right[k] = max(lower_limits[d], min(upper_limits[d], q_right[k]))
 
             set_arm_joints(robot_info, q_left, q_right)
             for k, j in enumerate(left_arm_joint_indices):
@@ -709,6 +751,35 @@ def solve_dual_arm_ik(
     if verbose:
         print(f"[IK] Done: {collision_count}/{n_frames} collisions, {jump_clamp_count} jump clamps")
     return left_traj, right_traj, collision_count
+
+
+# -----------------------------------------------------------------------------
+# Joint trajectory clamp to URDF limits
+# -----------------------------------------------------------------------------
+def clamp_joint_trajectory_to_limits(
+    left_traj: np.ndarray,
+    right_traj: np.ndarray,
+    robot_info: dict[str, Any],
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    将左右臂关节轨迹限幅到 URDF 关节限制内。
+    修复 KF 平滑或插值后可能超限的值。
+    """
+    dof_per_joint = robot_info["dof_per_joint"]
+    lower = robot_info["lower_limits"]
+    upper = robot_info["upper_limits"]
+
+    def _clamp_arm(traj: np.ndarray, arm_joint_indices: list[int]) -> np.ndarray:
+        out = np.array(traj, dtype=float)
+        for k, j in enumerate(arm_joint_indices):
+            d = dof_per_joint.index(j)
+            lo, hi = lower[d], upper[d]
+            out[:, k] = np.clip(out[:, k], lo, hi)
+        return out
+
+    left_out = _clamp_arm(left_traj, robot_info["left_arm_joint_indices"])
+    right_out = _clamp_arm(right_traj, robot_info["right_arm_joint_indices"])
+    return left_out, right_out
 
 
 # -----------------------------------------------------------------------------
@@ -1221,6 +1292,7 @@ def process_single_clip(
     robot_id: int | None = None,
     robot_info: dict[str, Any] | None = None,
     auto_disconnect: bool = True,
+    clip_id: str | None = None,
 ) -> dict:
     """
     Process single clip: IK solve -> Joint KF -> error stats -> save.
@@ -1234,7 +1306,8 @@ def process_single_clip(
 
     Returns: stats dict (same as stats.json content).
     """
-    clip_id = os.path.splitext(os.path.basename(json_path))[0]
+    if clip_id is None:
+        clip_id = os.path.splitext(os.path.basename(json_path))[0]
 
     # --- Load data ---
     (
@@ -1285,6 +1358,11 @@ def process_single_clip(
     jkf = JointKalmanFilter(n_dim=6, dt=1.0 / fps, q_var=50.0, r_var=5e-3)
     left_joint_traj = jkf.filter_and_smooth(left_arr, edge_pad=KF_EDGE_PAD)
     right_joint_traj = jkf.filter_and_smooth(right_arr, edge_pad=KF_EDGE_PAD)
+
+    # --- 限幅到 URDF 关节限制（KF/插值后可能超限）---
+    left_joint_traj, right_joint_traj = clamp_joint_trajectory_to_limits(
+        np.asarray(left_joint_traj), np.asarray(right_joint_traj), robot_info
+    )
 
     # --- Per-joint max frame-to-frame delta (on final smoothed trajectory) ---
     left_final = np.asarray(left_joint_traj)

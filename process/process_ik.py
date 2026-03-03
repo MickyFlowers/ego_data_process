@@ -39,6 +39,7 @@ Usage:
 import argparse
 import collections
 import glob
+import json
 import math
 import os
 import random
@@ -47,6 +48,28 @@ import time
 import ray
 
 MAX_CLIP_RETRIES = 2
+
+
+def _load_clip_ids_from_clip_parts(path: str) -> set[str]:
+    """从 clip_parts.json 提取所有 clip_id。支持 [[path, ...], ...] 或 [clip_id, ...] 格式。"""
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    def _basename_to_id(p: str) -> str:
+        s = os.path.basename(p.rstrip("/\\"))
+        return s[:-5] if s.endswith(".json") else s
+
+    ids = set()
+    for item in data:
+        if isinstance(item, list):
+            for p in item:
+                if isinstance(p, str) and p:
+                    ids.add(_basename_to_id(p))
+        elif isinstance(item, str) and item:
+            ids.add(_basename_to_id(item))
+        else:
+            ids.add(str(item))
+    return ids
 
 
 @ray.remote(max_restarts=5, max_task_retries=0)
@@ -156,12 +179,24 @@ def main():
                         help="Max parallel workers (default: num_cpus, capped at 64)")
     parser.add_argument("--camera-elevation", type=float, default=45.0, dest="camera_elevation_deg",
                         help="相机俯视角（度），默认 45")
+    parser.add_argument("--clip-parts", type=str, default=None,
+                        help="clip_parts.json 路径，从中读取所有 clip_id，仅处理这些 clip（input-dir 下需有对应 {clip_id}.json）")
     args = parser.parse_args()
 
-    json_files = sorted(glob.glob(os.path.join(args.input_dir, "*.json")))
-    if not json_files:
-        print(f"[Batch] No JSON files found in {args.input_dir}")
-        return
+    # json_files = sorted(glob.glob(os.path.join(args.input_dir, "*.json")))
+    # if not json_files:
+        # print(f"[Batch] No JSON files found in {args.input_dir}")
+        # return
+
+    if args.clip_parts and os.path.isfile(args.clip_parts):
+        clip_ids_allow = _load_clip_ids_from_clip_parts(args.clip_parts)
+        # print(clip_ids_allow)
+        json_files = [os.path.join(args.input_dir, f"{cid}.json") for cid in clip_ids_allow]
+        # json_files = [jp for jp in json_files if os.path.splitext(os.path.basename(jp))[0] in clip_ids_allow]
+        print(f"[Batch] --clip-parts: 使用 {len(clip_ids_allow)} 个 clip_id，匹配到 {len(json_files)} 个 JSON 文件")
+        if not json_files:
+            print(f"[Batch] 无匹配文件，退出")
+            return
 
     n_total = len(json_files)
     n_sample = max(1, math.ceil(n_total * args.sample_ratio))
@@ -215,9 +250,7 @@ def main():
 
     # ---- Actor pool with liveness tracking ----
     actors: list = [
-        IKWorkerActor.options(**actor_options).remote(
-            args.urdf_path, args.camera_elevation_deg
-        )
+        IKWorkerActor.options(**actor_options).remote(args.urdf_path, args.camera_elevation_deg)
         for _ in range(max_workers)
     ]
     actor_alive: list[bool] = [True] * max_workers
@@ -337,8 +370,6 @@ def main():
                 pass
 
     # ---- Summary ----
-    import json
-
     total_time = time.time() - t_start
     success_results = [r for r in results if "error" not in r]
     total_frames = sum(r.get("n_frames", 0) for r in success_results)

@@ -11,3 +11,4 @@ imageio-ffmpeg
 scipy
 matplotlib
 h5py
+supabase
