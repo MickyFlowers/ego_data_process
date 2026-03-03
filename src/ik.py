@@ -1343,12 +1343,7 @@ def process_single_clip(
         robot_info, left_pose_matrix, right_pose_matrix, verbose=verbose
     )
     ik_time = time.time() - t0
-
-    # --- IK errors (raw, before repair) ---
-    ik_stats, *_ = compute_ik_errors(
-        robot_info, left_joint_traj, right_joint_traj,
-        left_pose_matrix, right_pose_matrix,
-    )
+    
 
     # --- Repair IK jumps (branch-switch detection + interpolation) ---
     left_arr, n_left_repaired = repair_joint_trajectory_jumps(np.array(left_joint_traj), verbose=verbose)
@@ -1358,10 +1353,15 @@ def process_single_clip(
     jkf = JointKalmanFilter(n_dim=6, dt=1.0 / fps, q_var=50.0, r_var=5e-3)
     left_joint_traj = jkf.filter_and_smooth(left_arr, edge_pad=KF_EDGE_PAD)
     right_joint_traj = jkf.filter_and_smooth(right_arr, edge_pad=KF_EDGE_PAD)
-
+    
     # --- 限幅到 URDF 关节限制（KF/插值后可能超限）---
     left_joint_traj, right_joint_traj = clamp_joint_trajectory_to_limits(
         np.asarray(left_joint_traj), np.asarray(right_joint_traj), robot_info
+    )
+
+    ik_stats, *_ = compute_ik_errors(
+        robot_info, left_joint_traj, right_joint_traj,
+        left_pose_matrix, right_pose_matrix,
     )
 
     # --- Per-joint max frame-to-frame delta (on final smoothed trajectory) ---
