@@ -155,7 +155,9 @@ def render_mask_diff_video(
             ma = (np.asarray(Image.fromarray(ma.astype(np.uint8) * 255).resize((w, h), Image.NEAREST)) > 127).astype(np.uint8)
         if mb.shape != (h, w):
             mb = (np.asarray(Image.fromarray(mb.astype(np.uint8) * 255).resize((w, h), Image.NEAREST)) > 127).astype(np.uint8)
-
+        
+        
+        
         # 黑=都无, 绿=都有, 红=仅A, 蓝=仅B
         vis = np.zeros((h, w, 3), dtype=np.uint8)
         both = np.logical_and(ma, mb)

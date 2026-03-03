@@ -717,10 +717,9 @@ class IsaacSimEnv:
         if self._render_product is None or self._seg_annotator is None or self._rgb_annotator is None:
             return None
         self.set_joint(left_joint_angle, right_joint_angle)
+        # 双 step 消除一帧延迟：GPU 渲染是异步的，首次 step 后 get_data 拿到的是上一帧结果
+        # self._world.step(render=True)
         self._world.step(render=True)
-        import omni.replicator.core as rep
-
-        # rep.orchestrator.step(rt_subframes=1)
         rgb = self._rgb_annotator.get_data()
         if isinstance(rgb, dict):
             rgb = rgb.get("data", rgb)
@@ -1063,8 +1062,9 @@ def _render_single_clip(env: IsaacSimEnv, data_dir: str, opts: argparse.Namespac
                     Image = None
 
                 # Mask frame (simulation before overlay): robot silhouette for mask/{clip_id}.mp4
+                # 跳过第一帧：避免渲染管线延迟导致的首帧异常
                 mask_frame = np.stack([mask.astype(np.uint8) * 255] * 3, axis=-1)
-                if mask_writer is not None:
+                if mask_writer is not None and frame_idx > 0:
                     mask_writer.append_data(mask_frame[:, :, :3])
 
                 if do_overlay and source_reader is not None and Image is not None:
@@ -1097,7 +1097,8 @@ def _render_single_clip(env: IsaacSimEnv, data_dir: str, opts: argparse.Namespac
                         out_frame = robot_rgb
                 else:
                     out_frame = robot_rgb
-                writer.append_data(out_frame[:, :, :3])
+                if frame_idx > 0:
+                    writer.append_data(out_frame[:, :, :3])
         elif not do_render:
             env.set_joint(left_q, right_q)
             env.step()
