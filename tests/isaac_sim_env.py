@@ -5,6 +5,8 @@ Videos saved to output_dir/video/ (or output_dir/part{i}/video/ when using --cli
 
     python tests/isaac_sim_env.py --input-dir outputs/ik/data --output-dir outputs/render --headless --num-workers 2
     python tests/isaac_sim_env.py --clip-parts outputs/clip_parts.json --part 0 --output-dir outputs/render --headless --num-workers 2
+    python tests/isaac_sim_env.py --filter-result filter_result.json --output-dir outputs/render --headless
+    python tests/isaac_sim_env.py --filter-result filter_result_part0.json --output-dir outputs/render/part0 --headless
 """
 
 from __future__ import annotations
@@ -1297,11 +1299,38 @@ if __name__ == "__main__":
         default=None,
         help="Part index (0-based) when using --clip-parts. Output saved to output_dir/part{i}.",
     )
+    parser.add_argument(
+        "--filter-result",
+        type=str,
+        default=None,
+        help="Path to filter_result.json or filter_result_partN.json. When set, only render clips in filtered_clips. Base path: --input-dir/--data-dir, or default ml-egodex/ik/data.",
+    )
     args = parser.parse_args()
+
+    # 仅指定 filter_result 时的默认数据根目录
+    _DEFAULT_FILTER_DATA_DIR = "/home/ss-oss1/data/dataset/egocentric/ml-egodex/ik/data"
 
     # Determine clip directories
     clip_dirs: list[str] = []
-    if args.clip_parts and os.path.isfile(args.clip_parts):
+    if args.filter_result and os.path.isfile(args.filter_result):
+        # 从 filter_result.json / filter_result_partN.json 读取 clip 列表，仅渲染这些
+        base = args.input_dir or args.data_dir
+        if not base or not os.path.isdir(base):
+            base = _DEFAULT_FILTER_DATA_DIR
+        if not os.path.isdir(base):
+            raise ValueError(
+                f"--filter-result 需配合 --input-dir 或 --data-dir，或确保默认路径存在: {base}"
+            )
+        with open(args.filter_result) as f:
+            filter_data = json.load(f)
+        filtered_clips = filter_data.get("filtered_clips", [])
+        if not filtered_clips:
+            raise ValueError(f"--filter-result 中 filtered_clips 为空: {args.filter_result}")
+        root = _resolve_clip_root(base)
+        clip_dirs = [os.path.abspath(os.path.join(root, cid)) for cid in filtered_clips]
+        part_info = f" (part {filter_data.get('part_index', '?')}/{filter_data.get('num_parts', '?')})" if "part_index" in filter_data else ""
+        print(f"[IsaacSimEnv] Filter mode: {len(clip_dirs)} clips from {os.path.basename(args.filter_result)}{part_info}", flush=True)
+    elif args.clip_parts and os.path.isfile(args.clip_parts):
         # Load from process_clip_dataset result
         with open(args.clip_parts) as f:
             clip_parts = json.load(f)
